@@ -47,9 +47,12 @@
 
     let notice: string | null = null;
     let lastId = '';
-    $: if (detail.id !== lastId) { lastId = detail.id; notice = null; confirmStop = false; stopping = false; }
+    $: if (detail.id !== lastId) { lastId = detail.id; notice = null; confirmStop = false; }
     let confirmStop = false;
-    let stopping = false;
+    /** A `session.stop` for this item's session is in flight. The page keeps
+     * the lock per session (handling/handled.ts), so it outlives this panel
+     * and a switch to another item. */
+    export let stopBusy = false;
 
     // Offline wording only when a handler could keep the answer for later.
     $: ps = primaryState(detail, answer, offline !== null && !!onSubmit);
@@ -79,7 +82,7 @@
     }
     /** ⌘↵: the main button. */
     export function submit() {
-        if (receipt || confirmStop || stopping) return;
+        if (receipt || confirmStop || stopBusy) return;
         if (ps.chat) { openChat(); return; }
         if (ps.off) return;
         if (onSubmit) onSubmit(answer);
@@ -88,12 +91,10 @@
         if (!offline) onNo?.();
     }
     async function stop() {
-        if (!onStop || stopping) return;
-        stopping = true;
+        if (!onStop || stopBusy) return;
         notice = null;
         try { await onStop(); confirmStop = false; }
         catch (e) { notice = `沒有停止：${(e as { msg?: string; message?: string })?.msg ?? (e as { message?: string })?.message ?? String(e)}`; }
-        stopping = false;
     }
     $: sendNote = detail.canAnswer && onSubmit && !detail.sendBlock
         ? `送出後跳到下一件。10 秒後才真的送出，在那之前可以按「復原」（⌘Z）。`
@@ -223,13 +224,13 @@
                 <div class="confirm" role="group" aria-label="確認停止" data-confirm-stop>
                     <span>停止 {detail.who}？這會結束它的程式，不能復原。</span>
                     <div class="row">
-                        <button type="button" class="btn" disabled={stopping} on:click={() => (confirmStop = false)}>取消</button>
-                        <button type="button" class="btn danger" disabled={stopping} on:click={stop} data-stop-confirm>{stopping ? '停止中…' : '停止（不能復原）'}</button>
+                        <button type="button" class="btn" disabled={stopBusy} on:click={() => (confirmStop = false)}>取消</button>
+                        <button type="button" class="btn danger" disabled={stopBusy} on:click={stop} data-stop-confirm>{stopBusy ? '停止中…' : '停止（不能復原）'}</button>
                     </div>
                 </div>
             {/if}
             <div class="row">
-                {#if onStop}<button type="button" class="btn" disabled={confirmStop || !!offline} on:click={() => (confirmStop = true)} data-stop>停止這個 agent…</button>{/if}
+                {#if onStop}<button type="button" class="btn" disabled={confirmStop || stopBusy || !!offline} on:click={() => (confirmStop = true)} data-stop>{stopBusy ? '停止中…' : '停止這個 agent…'}</button>{/if}
                 {#if detail.no}<button type="button" class="btn" disabled={!onNo || !!offline} on:click={no}>{detail.no}</button>{/if}
                 {#if detail.canAnswer}<button type="button" class="btn" disabled={!onOpenChat} on:click={openChat}>開啟對談<kbd>⌘O</kbd></button>{/if}
                 <button type="button" class="btn primary" disabled={primaryOff} on:click={submit} data-primary data-preview={preview || undefined}>

@@ -11,6 +11,9 @@ import type { DemoFact, DemoNeedDetail, DemoOption, DemoShot, NeedVerb } from '.
 
 export type HandlingDetail = {
     id: string;
+    /** The request instance (`Need.instance`): handled marks, drafts and
+     * receipts use it. */
+    instance: string;
     verb: NeedVerb;
     title: string;
     /** The agent's name. */
@@ -119,7 +122,7 @@ export function buildDetail(need: Need, workspaces: WorkspaceView[], demo: DemoN
     const d = demo?.find(x => x.agentId === need.agentId) ?? null;
     const talk = member?.role === 'talk';
     const base: HandlingDetail = {
-        id: need.id, verb: need.verb, title: plainTitle(need, member), who, where, since: need.since,
+        id: need.id, instance: need.instance, verb: need.verb, title: plainTitle(need, member), who, where, since: need.since,
         why: null, code: null, facts: null, shots: null, options: null,
         freeIdx: -1, freeLabel: '', rejectIdx: -1, rejectLabel: '', input: null, text: null, rule: null,
         primary: '送出', no: null, note: '', reversible: true, canAnswer: true, sendBlock: null, managed: managed(member)

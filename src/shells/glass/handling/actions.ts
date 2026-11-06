@@ -6,8 +6,9 @@
  * - Each waiting send has its own timer. A new send, a receipt or a notice
  *   never ends or replaces another one (handoff tests #2, #3).
  * - Leaving the 需要你 page or closing the window sends nothing: the page
- *   calls `cancelAll` when it goes away, and a closed window runs no timer.
- *   The toast says so. The draft stays in memory, so the item comes back
+ *   calls `cancelAll` when it goes away or the window closes (the main
+ *   window only hides, so its timers would still run), and `canSend` is
+ *   checked again right before each send. The toast says so. The draft stays in memory, so the item comes back
  *   with what was typed (until the window closes).
  * - A send that fails is not sent again. The item goes back to the queue
  *   (engine-impact 36: an unsure result goes back to the person). */
@@ -42,6 +43,10 @@ const realTimers: Timers = {
     clear: h => clearTimeout(h as ReturnType<typeof setTimeout>)
 };
 
+/** Send ids are unique for the whole window life, not per queue: the
+ * handled list outlives a page and matches rows by send id. */
+let sendSeq = 0;
+
 const message = (e: unknown) =>
     e && typeof e === 'object' && 'msg' in e ? String((e as { msg: unknown }).msg) : e instanceof Error ? e.message : String(e);
 
@@ -49,8 +54,9 @@ const message = (e: unknown) =>
 export class SendQueue {
     private items: { p: Pending; fire: () => Promise<void>; timer: unknown }[] = [];
     private listeners = new Set<(list: Pending[]) => void>();
-    private n = 0;
-    constructor(private onEvent: (e: QueueEvent) => void = () => {}, private timers: Timers = realTimers, private delay = UNDO_MS) {}
+    /** `canSend` is asked right before each send; false ends the send unsent
+     * (a `cancelled` event). */
+    constructor(private onEvent: (e: QueueEvent) => void = () => {}, private timers: Timers = realTimers, private delay = UNDO_MS, private canSend: () => boolean = () => true) {}
 
     /** The sends that are waiting or running, oldest first. */
     get list(): Pending[] { return this.items.map(x => ({ ...x.p })); }
@@ -63,7 +69,7 @@ export class SendQueue {
 
     /** Waits `delay` ms, then calls `fire`. Returns the send id. */
     schedule(itemId: string, label: string, fire: () => Promise<void>): string {
-        const id = `send-${++this.n}`;
+        const id = `send-${++sendSeq}`;
         const p: Pending = { id, itemId, label, deadline: this.timers.now() + this.delay, state: 'waiting' };
         const item = { p, fire, timer: null as unknown };
         item.timer = this.timers.set(() => void this.run(id), this.delay);
@@ -74,6 +80,11 @@ export class SendQueue {
     private async run(id: string) {
         const item = this.items.find(x => x.p.id === id);
         if (!item || item.p.state !== 'waiting') return;
+        if (!this.canSend()) {
+            this.drop(id);
+            this.onEvent({ kind: 'cancelled', pending: { ...item.p } });
+            return;
+        }
         item.p.state = 'sending';
         this.publish();
         try {

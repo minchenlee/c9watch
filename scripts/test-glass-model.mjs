@@ -226,6 +226,27 @@ test('a request is answered only by a delivered reply from its recipient', () =>
     assert.equal(open(reply({ from: { kind: 'agent', addr: 'm/agt_h' } })), 0);
 });
 
+test('P2-3: the engine writes a sent answer as kind "info"; it still answers the request', () => {
+    const human = agent('agt_h', '/code', { role: 'human' });
+    const q = { msgId: 'q', kind: 'request', to: { id: 'agt_h' }, from: { kind: 'agent', addr: 'm/agt_w' }, state: 'delivered', preview: 'q', createdAt: NOW, replyTo: null };
+    const info = more => ({ msgId: 'r', kind: 'info', to: { id: 'agt_w' }, from: { kind: 'human', addr: null }, state: 'sent', replyTo: 'q', createdAt: NOW, ...more });
+    const open = r => derive({ agents: [agent('agt_w', '/x'), human], mail: [q, r] }).needs.length;
+    assert.equal(open(info({})), 0);
+    assert.equal(open(info({ state: 'failed' })), 1);
+    assert.equal(open(info({ replyTo: 'other' })), 1);
+    assert.equal(open(info({ from: { kind: 'agent', addr: 'm/agt_other' } })), 1);
+});
+
+test('P2-4: handled marks key the request instance; a new request with the same text is a new instance', () => {
+    const human = agent('agt_h', '/code', { role: 'human' });
+    const q = msgId => ({ msgId, kind: 'request', to: { id: 'agt_h' }, from: { kind: 'agent', addr: 'm/agt_w' }, state: 'delivered', preview: '要哪個?', createdAt: NOW, replyTo: null });
+    const one = derive({ agents: [agent('agt_w', '/x'), human], mail: [q('q1')] }).needs[0];
+    const two = derive({ agents: [agent('agt_w', '/x'), human], mail: [q('q2')] }).needs[0];
+    assert.equal(one.title, two.title);
+    assert.notEqual(one.instance, two.instance);
+    assert.equal(one.instance, derive({ agents: [agent('agt_w', '/x'), human], mail: [q('q1')] }).needs[0].instance);
+});
+
 test('a session row without sessionKey keys its member and row by provider:id', () => {
     const bare = (id, path) => { const v = view(undefined, path, { id, provider: 'claudeCode' }); delete v.sessionKey; return v; };
     const m = derive({ sessions: [bare('a', '/r/one'), bare('b', '/r/one'), bare('c', '/r/two')] });

@@ -28,6 +28,10 @@ const gaps = await load('../model/gaps-demo', M + 'gaps-demo.ts');
 urls['./gaps-demo'] = urls['../model/gaps-demo'];
 const { buildDetail, primaryState, emptyAnswer, waitText, fieldStep, answerBody, answerLabel, noBody } = await load('./detail', '../src/shells/glass/handling/detail.ts');
 const { SendQueue, secondsLeft, stepFrom } = await load('./actions', '../src/shells/glass/handling/actions.ts');
+// handled.ts imports svelte/store: point it at the real module.
+urls['svelte/store'] = import.meta.resolve('svelte/store');
+urls['../model/needs'] = urls['./needs'];
+const H = await load('./handled', '../src/shells/glass/handling/handled.ts');
 
 const NOW = 1_800_000_000_000;
 const GAPS = { workspaces: gaps.DEMO_WORKSPACES, goals: gaps.DEMO_GOALS, needs: gaps.DEMO_NEEDS };
@@ -239,4 +243,50 @@ test('stepFrom: J / K skip handled items; a receipt moves on from where it was',
     assert.equal(stepFrom(order, new Set(['a', 'b', 'c', 'd']), 'b', 1), null);
     assert.equal(stepFrom(order, new Set(), null, 1), 'a');
     assert.equal(stepFrom(order, new Set(), null, -1), 'd');
+});
+
+test('P2-5: send ids stay unique across queues (one per window lifetime)', () => {
+    const a = new SendQueue(() => {}), b = new SendQueue(() => {});
+    const ids = [a.schedule('x', 'x', async () => {}), b.schedule('y', 'y', async () => {}), a.schedule('z', 'z', async () => {})];
+    assert.equal(new Set(ids).size, 3);
+    a.cancelAll(); b.cancelAll();
+});
+
+test('P1-1: the queue checks canSend just before a send; false cancels it', async () => {
+    const tm = fakeTimers(), events = [];
+    let ok = true, sent = 0;
+    const q = new SendQueue(e => events.push(e.kind), tm, 10_000, () => ok);
+    q.schedule('i', 'l', async () => { sent++; });
+    ok = false;
+    await tm.advance(10_000);
+    assert.equal(sent, 0);
+    assert.deepEqual(events, ['cancelled']);
+    assert.equal(q.has('i'), false);
+});
+
+test('P1-2: the stop lock is per session and outlives the panel', () => {
+    assert.equal(H.lockStop('s1'), true);
+    assert.equal(H.lockStop('s1'), false);
+    assert.equal(H.lockStop('s2'), true);
+    let seen;
+    const off = H.stopping.subscribe(v => (seen = v));
+    assert.deepEqual([...seen].sort(), ['s1', 's2']);
+    H.unlockStop('s1');
+    assert.equal(H.lockStop('s1'), true);
+    H.unlockStop('s1'); H.unlockStop('s2');
+    assert.equal(seen.size, 0);
+    off();
+});
+
+test('P2-4: handled marks prune by instance', () => {
+    let seen;
+    const off = H.handled.subscribe(v => (seen = v));
+    H.markHandled('mail:q1');
+    H.pruneHandled([{ instance: 'mail:q2' }]);
+    assert.equal(seen.has('mail:q1'), false);
+    H.markHandled('mail:q2');
+    H.pruneHandled([{ instance: 'mail:q2' }]);
+    assert.equal(seen.has('mail:q2'), true);
+    H.unmarkHandled('mail:q2');
+    off();
 });

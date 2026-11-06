@@ -83,19 +83,29 @@ G5 actions (`handling/actions.ts`, pure, `scripts/test-glass-handling.mjs`):
   ends. Each send has its own timer and toast (`UndoToasts.svelte`); ⌘Z
   undoes the newest, each toast has its own 復原. A failed send is not
   sent again; the item goes back to the queue with an error notice.
-- Leaving the 需要你 page or closing the window sends nothing: the page
-  cancels every waiting send on destroy, and the toast says so. Drafts
-  stay in memory (module state) until the window closes.
+- Leaving the 需要你 page or closing the window sends nothing, and the
+  toast says so. Leaving: the page cancels every waiting send on destroy.
+  Closing only hides the window (src-tauri `lib.rs`), so the page also
+  cancels on `tauri://close-requested`, `visibilitychange` = hidden and
+  `pagehide`, and the queue checks `canSend` again just before each send.
+  The item goes back to the queue; the draft stays in memory (module
+  state) until c9watch quits. Send ids are unique for the window lifetime.
 - Stop (managed agents only): `session.stop` after a second click, then a
-  receipt. The receipt does not take ⌘↵; J goes to the 「下一件」 it names.
+  receipt. The stop lock is per session (`handling/handled.ts`), taken
+  before the call, so switching items cannot start a second stop. The receipt does not take ⌘↵; J goes to the 「下一件」 it names.
 - 給: c9watch does not send keys (a key sent as mail stays in the mail
   log); 「我沒有這把 key」 can be sent.
 - Offline: nothing is kept for later. The main button is off and reads
   「斷線了，連上後再送」.
 - Demo: the glass fixture answers `msg.send` and `session.stop` in
   `demoTransport` (`$lib/data/demo.ts`), so demo never reaches a core.
-- Handled items (`handled` in `pages/Needs.svelte`) leave the queue, J / K
-  and the side bar count while the same need is listed.
+- Handled items (`handled` in `handling/handled.ts`) leave the queue, J / K
+  and the side bar count. Marks, drafts and receipts use the request
+  instance (`Need.instance`: the msgId, or the attention event, or the
+  generation), so a new request with the same text is a new item.
+- A mail request counts as answered when a mail names it in `replyTo`,
+  comes from the asked side (a human or the recipient agent) and did not
+  fail. Any `kind` counts: the engine writes a sent answer as `info`.
 - `tests/glass/needs.spec.ts`: the 7 handoff §3 interaction tests.
 
 G6 extension host (`ext/`, glass build plan §3, manifest per owner D41 R1–R12):

@@ -1,17 +1,12 @@
 <script context="module" lang="ts">
-    import { writable } from 'svelte/store';
     import type { Answer } from '../handling/detail';
     // Module state, so it stays when the person leaves the page and comes
-    // back (handoff test #5). Memory only: a closed window loses it.
-    // One draft per item.
+    // back (handoff test #5). Memory only: quitting the app loses it.
+    // One draft and one receipt per request instance (`Need.instance`).
     const drafts: Record<string, Answer> = {};
     type Receipt = { title: string; rows: [string, string][] };
     type Done = { id: string; send: string | null; verb: string; title: string; state: 'waiting' | 'sent' | 'stopped' };
     const kept: { receipts: Record<string, Receipt>; done: Done[] } = { receipts: {}, done: [] };
-    /** Handled items: need id → the need's title when it was handled. The
-     * queue, J / K (handoff test #4) and the side bar count skip an item
-     * while it is listed with the same title. */
-    export const handled = writable<ReadonlyMap<string, string>>(new Map());
 </script>
 
 <script lang="ts">
@@ -21,8 +16,10 @@
     // - Answer a managed agent: `msg.send` after 10 s (復原 = not sent yet).
     // - Stop a managed agent: `session.stop`, then a receipt (no undo).
     // - Observed sessions and 允許: ⌘O only (`openSession`).
-    // - Leaving this page or closing the window sends nothing (`onDestroy`
-    //   cancels every waiting send; the toast says so).
+    // - Leaving this page or closing (hiding) the window sends nothing: every
+    //   waiting send is cancelled, the item goes back to the queue and the
+    //   draft stays. The toast says so. The queue also checks before each
+    //   send (`canSend`).
     import { onDestroy, onMount } from 'svelte';
     import { get } from 'svelte/store';
     import type { C9pSessionView } from '$lib/c9p-1';
@@ -37,6 +34,8 @@
     import UndoToasts from '../handling/UndoToasts.svelte';
     import { answerBody, answerLabel, buildDetail, emptyAnswer, locate, noBody, waitText, type HandlingDetail } from '../handling/detail';
     import { SendQueue, stepFrom, type Pending, type QueueEvent } from '../handling/actions';
+    import { handled, lockStop, markHandled, stopping, unlockStop, unmarkHandled } from '../handling/handled';
+    import { getCurrentWindow } from '$lib/data/platform';
 
     // Demo details only while the glass fixture is on: live mode never shows them.
     $: demo = $fixtureOn ? DEMO_NEED_DETAILS : null;
@@ -44,24 +43,24 @@
     $: details = needs.map(n => buildDetail(n, $model.workspaces, demo));
     $: order = details.map(d => d.id);
 
-    $: hiddenIds = new Set(needs.filter(n => $handled.get(n.id) === n.title).map(n => n.id));
-    // Forget an item once the model no longer lists it.
-    $: { const live = new Set(order); if ([...$handled.keys()].some(id => !live.has(id))) handled.set(new Map([...$handled].filter(([id]) => live.has(id)))); }
+    // Handled marks use the request instance: a new request with the same
+    // text is a new item. The shell forgets instances the model drops.
+    $: hiddenIds = new Set(details.filter(d => $handled.has(d.instance)).map(d => d.id));
 
     let receipts = kept.receipts;
     $: kept.receipts = receipts;
 
     let currentId: string | null = null;
-    $: current = details.find(d => d.id === currentId && (!hiddenIds.has(d.id) || receipts[d.id])) ?? details.find(d => !hiddenIds.has(d.id)) ?? null;
+    $: current = details.find(d => d.id === currentId && (!hiddenIds.has(d.id) || receipts[d.instance])) ?? details.find(d => !hiddenIds.has(d.id)) ?? null;
     $: index = current ? order.indexOf(current.id) : -1;
-    $: receipt = current ? receipts[current.id] ?? null : null;
+    $: receipt = current ? receipts[current.instance] ?? null : null;
     $: nextId = current ? stepFrom(order, hiddenIds, current.id, 1) : null;
     $: next = nextId ? details.find(d => d.id === nextId) ?? null : null;
     $: currentNeed = current ? needs.find(x => x.id === current.id) ?? null : null;
     $: member = currentNeed ? locate(currentNeed, $model.workspaces).member : null;
 
     let answers = drafts;
-    $: if (current && !answers[current.id]) answers[current.id] = emptyAnswer();
+    $: if (current && !answers[current.instance]) answers[current.instance] = emptyAnswer();
 
     // Handled this app run, oldest first. Their verbs are not orange: they
     // no longer need you (handoff 「實作前要改的錯」 #3).
@@ -86,7 +85,9 @@
     }
     const dismiss = (id: string) => (notices = notices.filter(n => n.id !== id));
 
-    function unhide(itemId: string) { handled.update(m => { const n = new Map(m); n.delete(itemId); return n; }); }
+    // A pending send's itemId is the request instance.
+    const idOf = (instance: string) => details.find(d => d.instance === instance)?.id ?? null;
+    let destroyed = false;
     function onQueue(e: QueueEvent) {
         const p = e.pending;
         if (e.kind === 'sent') {
@@ -96,20 +97,50 @@
             return;
         }
         done = kept.done = done.filter(x => x.send !== p.id);
-        unhide(p.itemId);
-        if (e.kind === 'cancelled') return;
+        unmarkHandled(p.itemId);
+        if (e.kind === 'cancelled') {
+            // Leaving the page: nothing to say. Closing the window: say it
+            // when the person comes back. The draft stays.
+            if (!destroyed) notify(`沒送出：${p.label}。視窗關掉了，這件回到需要你，草稿還在。`, 'error');
+            return;
+        }
         if (e.kind === 'undone') {
-            show(p.itemId);
+            show(idOf(p.itemId));
             notify(`復原了：${p.label}。沒有送出。`, 'info');
         } else {
             notify(`沒送出：${p.label}。${e.error}。這件回到需要你，c9watch 不會自動再送。`, 'error');
         }
     }
-    const queue = new SendQueue(onQueue);
+    // Closing the window only hides it (src-tauri lib.rs), so the page and
+    // its timers live on. A hidden window sends nothing: hiding cancels
+    // every waiting send, and the queue checks again just before a send.
+    let windowHidden = false;
+    const canSend = () => !windowHidden && (typeof document === 'undefined' || document.visibilityState !== 'hidden');
+    const queue = new SendQueue(onQueue, undefined, undefined, canSend);
     const stopQueue = queue.subscribe(l => (pending = l));
+    function onHide() { windowHidden = true; queue.cancelAll(); }
+    function onVisibility() {
+        if (document.visibilityState === 'hidden') onHide();
+        else windowHidden = false;
+    }
+    let unlistenClose: (() => void) | null = null;
+    onMount(() => {
+        document.addEventListener('visibilitychange', onVisibility);
+        window.addEventListener('pagehide', onHide);
+        // The Tauri close button (not in a plain browser).
+        try {
+            getCurrentWindow().listen('tauri://close-requested', onHide)
+                .then(u => { if (destroyed) u(); else unlistenClose = u; })
+                .catch(() => {});
+        } catch { /* not in Tauri */ }
+    });
     onDestroy(() => {
         // Leaving the page sends nothing (stated in the toast).
+        destroyed = true;
         queue.cancelAll();
+        if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
+        if (typeof window !== 'undefined') window.removeEventListener('pagehide', onHide);
+        unlistenClose?.();
         stopQueue();
         clearInterval(timer);
         for (const t of noticeTimers) clearTimeout(t);
@@ -138,10 +169,9 @@
 
     /** Marks `d` handled and moves to the 「下一件」 the panel showed
      * (handoff test #1). */
-    function markHandled(d: HandlingDetail, send: string | null, state: Done['state']) {
+    function finish(d: HandlingDetail, send: string | null, state: Done['state']) {
         const to = stepFrom(order, hiddenIds, d.id, 1);
-        const title = needs.find(n => n.id === d.id)?.title ?? d.title;
-        handled.update(m => new Map(m).set(d.id, title));
+        markHandled(d.instance);
         done = [...done, { id: d.id, send, verb: d.verb, title: d.title, state }];
         if (state !== 'stopped') show(to);
     }
@@ -151,11 +181,13 @@
         if (!d.managed || !to) return;
         const replyTo = n?.msgId ?? null;
         now = Date.now();
-        const send = queue.schedule(d.id, label, async () => {
+        // The person acts, so the window shows.
+        windowHidden = false;
+        const send = queue.schedule(d.instance, label, async () => {
             const error = await sendMail(to, body, replyTo);
             if (error) throw new Error(error);
         });
-        markHandled(d, send, 'waiting');
+        finish(d, send, 'waiting');
     }
     function submit(a: Answer) {
         if (!current || offlineSince !== null) return;
@@ -173,8 +205,13 @@
     $: chatOf = member?.session ? ((s) => () => openSession(sessionFromView(s)))(member.session) : undefined;
     // Stop: managed agents only (observed sessions get ⌘O only), with a pid
     // the engine can stop.
+    const stopKey = (s: C9pSessionView) => `${s.pid}|${s.id}`;
     async function stop(d: HandlingDetail, s: C9pSessionView) {
-        await stopSession(sessionFromView(s));
+        // Second check, and the lock is taken before any await: one stop per
+        // session, whatever item the person moves to meanwhile.
+        const key = stopKey(s);
+        if (!lockStop(key)) return;
+        try { await stopSession(sessionFromView(s)); } finally { unlockStop(key); }
         const at = new Date();
         const rows: [string, string][] = [
             ['做了什麼', `停止了 ${d.who} 的程式`],
@@ -183,12 +220,13 @@
             ['能不能復原', '不能。要它再做事，請重新啟動它。']
         ];
         if (get(isDemoMode)) rows.push(['示範模式', '沒有真的停止任何程式']);
-        receipts = { ...receipts, [d.id]: { title: `已停止 ${d.who}`, rows } };
-        markHandled(d, null, 'stopped');
+        receipts = { ...receipts, [d.instance]: { title: `已停止 ${d.who}`, rows } };
+        finish(d, null, 'stopped');
     }
     $: stopOf = current && current.managed && member?.session?.canStop && member.session.pid && !receipt
         ? ((d: HandlingDetail, s: C9pSessionView) => () => stop(d, s))(current, member.session)
         : undefined;
+    $: stopBusy = !!member?.session && $stopping.has(stopKey(member.session));
 
     let panel: HandlingPanel | undefined;
     const keys: PageKeys = {
@@ -236,7 +274,7 @@
             <HandlingPanel
                 bind:this={panel}
                 detail={current}
-                bind:answer={answers[current.id]}
+                bind:answer={answers[current.instance]}
                 position={{ index: index + 1, total: details.length }}
                 next={next ? { verb: next.verb, title: next.title } : null}
                 offline={offlineSince !== null ? { since: offlineSince } : null}
@@ -247,6 +285,7 @@
                 onSubmit={current.canAnswer && current.managed ? submit : undefined}
                 onNo={current.canAnswer && current.managed && current.no ? no : undefined}
                 onStop={stopOf}
+                {stopBusy}
                 onUndo={() => undo()}
                 demo={$isDemoMode}
                 ruleMode={$fixtureOn ? 'preview' : 'hidden'}

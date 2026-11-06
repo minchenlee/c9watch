@@ -22,10 +22,11 @@ async function openNeeds(page: Page, storage: Record<string, string> = glass, se
  * which every c9p `SessionView` has; this adds it. `failAgentList` rejects
  * `agent.list`, as when the core is gone. `managed` makes the question
  * session (pid 41003) a managed engine agent and lets `msg.send` through
- * (the shared IPC mock refuses mail). Runs before the IPC mock. */
+ * (the shared IPC mock refuses mail). `slowStop` holds `session.stop` until
+ * the page calls `__C9_RELEASE_STOP__()`. Runs before the IPC mock. */
 const MANAGED = { id: 'agt_01VISUALMANAGED', sessionKey: 'claudeCode:0b6c1f0e-1111-4a2b-9c3d-000000000003' };
-async function live(page: Page, failAgentList = false, managed = false) {
-	await page.addInitScript(([fail, managed, M]) => {
+async function live(page: Page, failAgentList = false, managed = false, slowStop = false) {
+	await page.addInitScript(([fail, managed, M, slow]) => {
 		const internals: Record<string, unknown> = {};
 		let inner: ((cmd: string, args: any, o?: unknown) => unknown) | undefined;
 		const calls: { cmd: string; args: any }[] = ((window as any).__C9_CALLS__ = []);
@@ -36,6 +37,8 @@ async function live(page: Page, failAgentList = false, managed = false) {
 				return { agents: [{ id: M.id, sessionKey: M.sessionKey, name: 'w-cache', role: 'worker', parentId: null, cwd: '/Users/visual/projects/api-server', source: 'engine', control: 'pty', mode: 'managed', state: 'ready', status: 'needs_attention', generation: 1, goneAt: null, lastSeen: Date.now(), createdAt: Date.now() - 3_600_000, mailPaused: false }] };
 			if (managed && cmd === 'c9p_request' && args?.method === 'msg.send')
 				return { cursor: 'visual:send:1', msgId: 'msg_01VISUAL', paused: false, replayed: false, state: 'queued', to: { addr: `m/${args.params.to}`, id: args.params.to, name: 'w-cache' } };
+			if (slow && cmd === 'c9p_request' && args?.method === 'session.stop')
+				return new Promise(res => ((window as any).__C9_RELEASE_STOP__ = () => res(inner!(cmd, args, o))));
 			const r: any = await inner!(cmd, args, o);
 			if (cmd === 'c9p_request' && args?.method === 'session.views' && r?.sessions)
 				return { ...r, sessions: r.sessions.map((s: any) => ({ sessionKey: `${s.provider}:${s.id}`, ...s })) };
@@ -43,7 +46,7 @@ async function live(page: Page, failAgentList = false, managed = false) {
 		};
 		Object.defineProperty(internals, 'invoke', { configurable: true, get: () => call, set: (fn) => { inner = fn; } });
 		(window as any).__TAURI_INTERNALS__ = internals;
-	}, [failAgentList, managed, MANAGED] as const);
+	}, [failAgentList, managed, MANAGED, slowStop] as const);
 }
 const calls = (page: Page, method: string) => page.evaluate((m) => (window as any).__C9_CALLS__.filter((c: any) => c.cmd === 'c9p_request' && c.args?.method === m).map((c: any) => c.args.params), method);
 const MUTATING = ['msg.send', 'session.stop', 'msg.cancel', 'mail.pause', 'mail.resume'];
@@ -298,6 +301,54 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await page.locator('.glass-side [data-nav="needs"]').click();
 		await page.locator('.queue .qi', { hasText: 'rate limiter' }).click();
 		await expect(panel(page).locator('textarea')).toHaveValue('Use memory.');
+	});
+
+	test('G5 live: closing (hiding) the window cancels every waiting send; the item comes back with its draft', async ({ page }) => {
+		await live(page, false, true);
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		const item = page.locator('.queue .qi', { hasText: 'rate limiter' });
+		await item.click();
+		await panel(page).locator('textarea').fill('Use Redis.');
+		await page.keyboard.press('Meta+Enter');
+		await expect(page.locator('[data-undo]')).toBeVisible();
+		await expect(item).toHaveCount(0);
+		// The Tauri close button: lib.rs only hides the window.
+		await page.evaluate(() => (window as any).__TAURI_INTERNALS__.invoke('plugin:event|emit', { event: 'tauri://close-requested', payload: null }));
+		await expect(page.locator('[data-undo]')).toHaveCount(0);
+		await expect(page.locator('[data-notice]')).toContainText('視窗關掉了');
+		await page.clock.runFor(30_000);
+		expect(await calls(page, 'msg.send')).toEqual([]);
+		await item.click();
+		await expect(panel(page).locator('textarea')).toHaveValue('Use Redis.');
+		// The same for a hidden page (minimize, or a webview that hides).
+		await page.keyboard.press('Meta+Enter');
+		await expect(page.locator('[data-undo]')).toBeVisible();
+		await page.evaluate(() => {
+			Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+			document.dispatchEvent(new Event('visibilitychange'));
+		});
+		await page.clock.runFor(30_000);
+		expect(await calls(page, 'msg.send')).toEqual([]);
+		await expect(item).toHaveCount(1);
+	});
+
+	test('G5 live: switching items during a stop keeps the lock; session.stop runs once', async ({ page }) => {
+		await live(page, false, true, true);
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		const item = page.locator('.queue .qi', { hasText: 'rate limiter' });
+		await item.click();
+		await panel(page).locator('[data-stop]').click();
+		await panel(page).locator('[data-stop-confirm]').click();
+		await expect(panel(page).locator('[data-stop-confirm]')).toHaveText('停止中…');
+		await page.locator('.queue .qi', { hasText: '允許' }).click();
+		await item.click();
+		await expect(panel(page).locator('[data-stop]')).toBeDisabled();
+		await expect(panel(page).locator('[data-stop]')).toHaveText('停止中…');
+		await panel(page).locator('[data-stop]').click({ force: true });
+		await expect(panel(page).locator('[data-stop-confirm]')).toHaveCount(0);
+		await page.evaluate(() => (window as any).__C9_RELEASE_STOP__());
+		await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+		expect((await calls(page, 'session.stop')).length).toBe(1);
 	});
 
 	test('G5 live: stop a managed agent (session.stop, receipt); an observed session gets ⌘O only', async ({ page }) => {
