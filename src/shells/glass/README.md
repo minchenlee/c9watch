@@ -19,8 +19,15 @@ Rules:
 Demo data: one fixture in c9p shapes, `src/lib/data/demo/glass.ts`, on when
 `demoMode = 'true'` and `c9watch.demoGlass = '1'`. Data that c9p does not have yet
 (goals, needs verbs, seat caps, rules) is in `model/gaps-demo.ts` only. The
-shell shows fixture-only data (demo workspaces) only while the fixture is on;
-live mode lists no workspaces until the G2 derivation.
+shell shows fixture-only data (demo workspaces) only while the fixture is on.
+
+View model (`model/`, pure, `scripts/test-glass-model.mjs`): `data.ts` exports
+`model`, derived from sessions, agents and `agent.attention`. Workspaces are
+repo roots (worktrees fold into their repo; id = hash of the root). A row is a
+lead tree (`parentId`) or one talk session; demo goals only rename lead rows.
+Needs are derived from c9p facts; the gaps file is passed only while the
+fixture is on. `agent.list` is read again on each `agent.*` event; without
+that stream, on session changes (at most every 2 s).
 
 Preview (no baseline): `npx playwright test -c tests/visual/glass-preview.config.ts`.
 PNGs go to `tests/visual/.cache/glass-preview/`.

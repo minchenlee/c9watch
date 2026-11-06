@@ -86,7 +86,7 @@ export function glassDemoAgents(): C9pAgentRow[] {
         return {
             control: engine ? 'pty' : 'none', createdAt: msAgo(s.ago + 30), createdBy: engine ? (s.parent ? glassAgentId(s.parent) : 'local-unverified') : null,
             cwd: GLASS_DEMO_ROOTS[s.ws], generation: 1, goneAt: done ? msAgo(s.ago) : null, id: glassAgentId(s.slug),
-            interruptedNotePending: false, lastSeen: done ? null : msAgo(s.ago), machineId: MACHINE, mode: engine ? 'managed' : null,
+            interruptedNotePending: false, lastSeen: done ? null : msAgo(s.ago), machineId: MACHINE, mailPaused: false, mode: engine ? 'managed' : null,
             name: s.name, parentId: s.parent ? glassAgentId(s.parent) : null, pid: done ? null : pidOf(s),
             provider: s.provider === 'codex' ? 'codex' : 'claude', providerSid: sid(s.slug), resumeCount: 0, role: s.role,
             sessionKey: keyOf(s), source: engine ? 'engine' : 'detected', startedAt: msAgo(s.ago + 30),
