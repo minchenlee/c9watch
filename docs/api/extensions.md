@@ -81,7 +81,7 @@ The `c9ext://` file server sends only these file types: `.js`, `.mjs`, `.css`, `
 | `ui.pages` | With `ui` | 1 to 16 pages. |
 | `ui.pages[].id` | Yes | Same rule as `id`. Unique in the extension. |
 | `ui.pages[].title` | Yes | 1 to 40 characters, not only white space. |
-| `ui.pages[].entry` | Yes | A relative path inside the extension directory, at most 200 characters. No leading `/`, no empty, `.` or `..` segment, no `\`, `%`, `:`, `?` or `#`. |
+| `ui.pages[].entry` | Yes | A relative path inside the extension directory, at most 200 characters. No leading `/`, no empty, `.` or `..` segment, no `\`, `%`, `:`, `?` or `#`. The file must be an ES module named `.js` or `.mjs` (see below). |
 | `ui.pages[].icon` | No | A string of at most 40 characters. |
 | `dev` | No | `true` or `false`. When `true`, only development builds show the extension. |
 | `core` | No | Reserved for the core part. The glass shell does not run it and does not fail on it. |
@@ -108,12 +108,14 @@ c9watch ext check path/to/my-ext --json --pretty
 The check uses the glass shell's manifest rules and gives the same reason text. It also checks that:
 
 - every page entry is a file inside the directory, also after symlinks are resolved;
-- the file server sends every page entry;
+- every page entry is a `.js` or `.mjs` file with no path segment that starts with `.`. The host loads an entry with `import()`. When the entry is a symlink, the file it points to must follow the same rule, because the file server checks the real file's name. For example, `index.js` that points to `module.txt` fails;
 - `RECIPE.md` exists and `preview.png` is a PNG file, both inside the directory.
 
-It prints `PASS` or `FAIL`, then one line per `error`, `warning` and `note`. Exit code 0 means pass; 1 means fail. A warning (for example, a bad `core.events` item, or an entry that is not `.js` or `.mjs`) does not fail the check. A note says what the host will do, for example that `dev: true` hides the extension in production builds, or that this c9watch is older than `minVersion`.
+It prints `PASS` or `FAIL`, then one line per `error`, `warning` and `note`. Exit code 0 means pass; 1 means fail. A warning (for example, a bad `core.events` item) does not fail the check. A note says what the host will do, for example that `dev: true` hides the extension in production builds, or that this c9watch is older than `minVersion`.
 
 The check does not run the extension.
+
+Known limit: the check reads JSON with a stricter parser than the glass shell. A number out of double range (such as `1e400`), a lone surrogate escape (such as `"\ud800"`) or nesting deeper than 128 levels makes the check report invalid JSON, while the glass shell may accept the file. Do not use them.
 
 ## The `c9ui/1` API
 

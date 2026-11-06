@@ -7,6 +7,9 @@
 //! JavaScript semantics that differ from Rust are copied on purpose: string
 //! lengths count UTF-16 units, `trim()` uses the ECMAScript white space set,
 //! and a JSON number is compared as a double (`1.0 === 1`).
+//! Known limitation: serde_json rejects a few inputs JSON.parse accepts (a
+//! number out of f64 range such as `1e400`, a lone surrogate escape, nesting
+//! deeper than 128), so the check calls such a manifest invalid JSON.
 //!
 //! The file rules are the GUI crate's `c9ext://` server (`src-tauri/src/ext.rs`):
 //! a page entry must be a real file inside the extension directory after
@@ -378,22 +381,28 @@ fn inside(parent: &Path, child: &Path) -> bool {
 /// Why `<ext_dir>/<rel>` cannot be used, or None when it is a real file
 /// inside `ext_dir`. `ext_dir` is a real path.
 fn file_problem(ext_dir: &Path, rel: &str) -> Option<&'static str> {
+    real_file(ext_dir, rel).err()
+}
+
+/// The real path of `<ext_dir>/<rel>` when it is a file inside `ext_dir`,
+/// else why not.
+fn real_file(ext_dir: &Path, rel: &str) -> Result<PathBuf, &'static str> {
     let mut p = ext_dir.to_path_buf();
     p.extend(rel.split('/'));
     // `symlink_metadata` tells a dangling symlink from a missing file.
     if fs::symlink_metadata(&p).is_err() {
-        return Some("不存在");
+        return Err("不存在");
     }
     let Ok(real) = fs::canonicalize(&p) else {
-        return Some("是壞掉的 symlink");
+        return Err("是壞掉的 symlink");
     };
     if !inside(ext_dir, &real) {
-        return Some("透過 symlink 指到 extension 目錄外");
+        return Err("透過 symlink 指到 extension 目錄外");
     }
     if !real.is_file() {
-        return Some("不是檔案");
+        return Err("不是檔案");
     }
-    None
+    Ok(real)
 }
 
 /// One path segment the `c9ext://` server sends: no dot file, `\`, `%`,
@@ -406,14 +415,15 @@ fn servable_segment(s: &str) -> bool {
             .any(|c| matches!(c, '\\' | '%' | ':' | '/') || c.is_control())
 }
 
-/// The file types the `c9ext://` server sends (`allowed_type` in the GUI crate).
-fn servable_type(name: &str) -> bool {
-    name.rsplit_once('.').is_some_and(|(_, ext)| {
-        matches!(
-            ext.to_ascii_lowercase().as_str(),
-            "js" | "mjs" | "css" | "json" | "svg" | "png" | "woff2" | "md"
-        )
-    })
+/// A page entry file name: `.js` or `.mjs` (case-insensitive), not a dot
+/// file. The host loads an entry with `import()` (`Mount.svelte`), and the
+/// `c9ext://` server sends a module only by these extensions
+/// (`allowed_type` in the GUI crate).
+fn module_name(name: &str) -> bool {
+    !name.starts_with('.')
+        && name
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| matches!(ext.to_ascii_lowercase().as_str(), "js" | "mjs"))
 }
 
 /// Reads the manifest as the GUI crate does: at most the limit, lossy UTF-8.
@@ -515,7 +525,7 @@ pub fn check(given: &Path) -> Report {
     let (text, size) = read_manifest(&ext_dir);
     match parse_manifest(text.as_deref(), &r.dir, size) {
         Ok(p) => {
-            check_pages(&ext_dir, &p.manifest, &mut r.errors, &mut r.warnings);
+            check_pages(&ext_dir, &p.manifest, &mut r.errors);
             r.warnings.extend(p.warnings);
             r.notes = notes(&p.manifest, p.has_core);
             r.manifest = Some(p.manifest);
@@ -535,25 +545,27 @@ pub fn check(given: &Path) -> Report {
     r
 }
 
-/// Each page entry is a file the `c9ext://` server sends.
-fn check_pages(ext_dir: &Path, m: &Manifest, errors: &mut Vec<String>, warnings: &mut Vec<String>) {
+/// Each page entry is a module file the `c9ext://` server sends. Like the
+/// server, this checks the requested path and the real file it resolves to,
+/// so `index.js` → `module.txt` fails.
+fn check_pages(ext_dir: &Path, m: &Manifest, errors: &mut Vec<String>) {
     for (i, page) in m.pages.iter().flatten().enumerate() {
         let entry = &page.entry;
-        if let Some(why) = file_problem(ext_dir, entry) {
-            errors.push(format!("ui.pages[{i}].entry「{entry}」{why}"));
-            continue;
-        }
+        let real = match real_file(ext_dir, entry) {
+            Ok(real) => real,
+            Err(why) => {
+                errors.push(format!("ui.pages[{i}].entry「{entry}」{why}"));
+                continue;
+            }
+        };
         let name = entry.rsplit('/').next().unwrap_or(entry);
-        if !entry.split('/').all(servable_segment) || !servable_type(name) {
+        let real_name = real.file_name().map(|n| n.to_string_lossy());
+        if !entry.split('/').all(servable_segment)
+            || !module_name(name)
+            || !real_name.is_some_and(|n| module_name(&n))
+        {
             errors.push(format!(
-                "ui.pages[{i}].entry「{entry}」不會被 c9ext:// 送出（不能有 . 開頭的段落；副檔名要是 js、mjs、css、json、svg、png、woff2 或 md）"
-            ));
-            continue;
-        }
-        let lower = name.to_ascii_lowercase();
-        if !(lower.ends_with(".js") || lower.ends_with(".mjs")) {
-            warnings.push(format!(
-                "ui.pages[{i}].entry「{entry}」不是 .js 或 .mjs：host 用 import() 載入 entry"
+                "ui.pages[{i}].entry「{entry}」不是可載入的 module（檔名和 symlink 指到的檔名都要是 .js 或 .mjs，路徑不能有 . 開頭的段落）"
             ));
         }
     }
@@ -1000,7 +1012,10 @@ mod tests {
             ("run.sh", false),
             ("page.html", false),
             ("dist/index.mjs", true),
-            ("style.css", true),
+            ("Upper.JS", true),
+            ("style.css", false),
+            ("data.json", false),
+            ("notes.md", false),
         ] {
             if let Some((sub, _)) = entry.rsplit_once('/') {
                 create_dir_all(d.join(sub)).unwrap();
@@ -1012,8 +1027,8 @@ mod tests {
             set_manifest(&d, &m);
             let r = check(&d);
             assert_eq!(r.ok, ok, "{entry}: {:?}", r.errors);
-            if entry == "style.css" {
-                assert!(r.warnings[0].contains("不是 .js 或 .mjs"));
+            if !ok {
+                assert!(r.errors[0].contains("不是可載入的 module"), "{entry}");
             }
         }
         // A directory is not an entry.
@@ -1023,6 +1038,34 @@ mod tests {
         });
         set_manifest(&d, &m);
         assert_eq!(errors(&d), ["ui.pages[0].entry「dir.js」不是檔案"]);
+    }
+
+    /// The server checks the real file's name too (GUI crate `respond`):
+    /// a `.js` symlink to a file of another type, or to a dot file, fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_entry_is_checked_by_its_target_name() {
+        use std::os::unix::fs::symlink;
+        for (target, ok) in [
+            ("module.txt", false),
+            ("x.css", false),
+            (".hidden.js", false),
+            ("real.mjs", true),
+        ] {
+            let f = fx("hello");
+            let d = f.root.join("hello");
+            fs::remove_file(d.join("index.js")).unwrap();
+            write(d.join(target), "x").unwrap();
+            symlink(d.join(target), d.join("index.js")).unwrap();
+            let r = check(&d);
+            assert_eq!(r.ok, ok, "{target}: {:?}", r.errors);
+            if !ok {
+                assert_eq!(
+                    r.errors,
+                    ["ui.pages[0].entry「index.js」不是可載入的 module（檔名和 symlink 指到的檔名都要是 .js 或 .mjs，路徑不能有 . 開頭的段落）"]
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
