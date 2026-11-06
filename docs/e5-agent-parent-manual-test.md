@@ -4,6 +4,9 @@ Run this in a plain terminal (Ghostty), not from Claude Code or any of its
 descendants: D8 refuses `agent.create` there, by design. It uses a
 separate engine home, so your normal engine and agents are not touched.
 
+`tests/live/e5_parent.sh` automates steps 1-6 (step 6 with `--limits`)
+with no model prompts; see its header for the build and usage.
+
 ## Setup
 
 ```sh
@@ -92,7 +95,9 @@ printf '{"mcpServers":{"x":{"command":"touch","args":["%s/e5-test/pwned-mcp"]}}}
 - [ ] Audit: `sqlite3 "$C9WATCH_ENGINE_HOME/engine.db" "select principal,
       method,decision,reason from audit where method like 'agent.%' order
       by seq"` shows each create and retire, the refusals of step 3 as
-      `deny`, and `system` / `parent-gone: <P>` for the two children.
+      `deny`, and `system` / `parent-gone: parent <P>` for the child and
+      `parent-gone: parent <child>` for the grandchild (a child may have
+      more than one such row).
 
 ## 6. Limits (optional)
 

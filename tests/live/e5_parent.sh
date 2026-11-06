@@ -586,14 +586,21 @@ na=$(aud "method = 'agent.create' AND decision = 'allow' AND principal LIKE 'age
 nd=$(aud "method = 'agent.create' AND decision = 'deny' AND principal LIKE 'agent:$PA%'")
 nr=$(aud "method = 'agent.retire' AND decision = 'deny' AND principal LIKE 'agent:$PA%'")
 nra=$(aud "method = 'agent.retire' AND decision = 'allow' AND principal LIKE 'agent:$PA%'")
+# The sweep may write more than one row per child (ticketed), so every
+# count is a floor. Run 2026-11-06: create allow=3 deny=8, retire deny=2
+# allow=1, parent-gone=4 (reason `parent-gone: parent <id>`).
+pg_rows() { aud "method = 'agent.retire' AND principal = 'system' AND reason = 'parent-gone: parent $1'"; }
 ng=$(aud "method = 'agent.retire' AND principal = 'system' AND reason LIKE 'parent-gone:%'")
-npg=$(aud "method = 'agent.retire' AND principal = 'system' AND reason = 'parent-gone: $PA'")
+npg=$(pg_rows "$PA")
+ngc=1
+[ -n "$G" ] && [ -n "$C1" ] && ngc=$(pg_rows "$C1")
 want_g=$((${#TREE[@]} - 1))
-detail="parent creates allow=$na deny=$nd, retires deny=$nr allow=$nra, system parent-gone=$ng (naming $PA: $npg)"
-if [ "$na" -ge 2 ] && [ "$nd" -ge 6 ] && [ "$nr" -ge 2 ] && [ "$ng" -ge "$want_g" ] && [ "$npg" -ge 1 ]; then
+detail="parent creates allow=$na deny=$nd, retires deny=$nr allow=$nra, system parent-gone=$ng (naming parent $PA: $npg, naming parent ${C1:-none}: $ngc)"
+if [ "$na" -ge 3 ] && [ "$nd" -ge 8 ] && [ "$nr" -ge 2 ] && [ "$nra" -ge 1 ] &&
+    [ "$ng" -ge "$want_g" ] && [ "$npg" -ge 1 ] && [ "$ngc" -ge 1 ]; then
     ok 5-audit "$detail"
 else
-    bad 5-audit "$detail; want allow>=2 deny>=6 retire-deny>=2 parent-gone>=$want_g with one naming $PA"
+    bad 5-audit "$detail; want allow>=3 deny>=8 retire-deny>=2 retire-allow>=1 parent-gone>=$want_g, one naming parent $PA and one naming parent ${C1:-none}"
 fi
 q "SELECT principal, method, target, decision, reason FROM audit WHERE method LIKE 'agent.%' ORDER BY seq" >"$EV/5-audit-agent.txt"
 
