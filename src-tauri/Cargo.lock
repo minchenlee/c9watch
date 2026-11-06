@@ -469,6 +469,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "notify-rust",
+ "objc2-app-kit",
  "rand 0.8.5",
  "regex",
  "rusqlite",

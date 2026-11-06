@@ -9,7 +9,8 @@
     import type { Transport } from '$lib/data/transport';
     import { navigate, parseHash, routeHash, type GlassRoute } from '../nav';
     import { forwardKey, usePageKeys } from '../keys';
-    import { glassMode } from '../prefs';
+    // The mode .glass-root shows (Reduce Transparency forces off, G10b).
+    import { effectiveGlass as glassMode } from '../native';
     import { model } from '../data';
     import type { HostContext, HostTheme } from './host';
     import { extensions, extensionsLoaded, loadExtensions } from './registry';

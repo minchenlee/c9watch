@@ -103,3 +103,16 @@ test('working dot passes 3:1 as a non-text element, but not 4.5:1 as text', () =
   const ratio = contrast(parse(base, base['--status-working']), surfaces(base, DESKTOPS.black)['L1 surface-1']);
   assert.ok(ratio >= 3 && ratio < 4.5, ratio.toFixed(2));
 });
+
+test('G10b: the L0 tint lets more vibrancy through as Off → Subtle → Full', () => {
+  const alpha = mode => parse(modes[mode], modes[mode]['--surface-window'])[3];
+  assert.equal(alpha('off'), 1, 'Off is opaque');
+  assert.ok(alpha('subtle') < 1 && alpha('full') < alpha('subtle'), `subtle ${alpha('subtle')}, full ${alpha('full')}`);
+});
+
+test('G10b: html and body turn transparent only under html.glass-native', () => {
+  const rule = css.match(/([^{}]*)\{\s*background: transparent;\s*\}/);
+  assert.ok(rule, 'missing the transparent html/body rule');
+  const selectors = rule[1].replace(/\/\*[\s\S]*?\*\//g, '').split(',').map(s => s.trim());
+  assert.deepEqual(selectors, ['html.glass-native', 'html.glass-native body']);
+});

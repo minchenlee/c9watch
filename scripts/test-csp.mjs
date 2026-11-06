@@ -94,3 +94,24 @@ test('every URL the frontend references is covered by the CSP', () => {
   }
   assert.deepEqual(unknown, []);
 });
+
+// Glass G10b: native glass is macOS only. tauri.macos.conf.json is a JSON
+// merge patch, so its `windows` array replaces the base one: it must repeat
+// both windows exactly and add only the three glass keys to `main`.
+test('tauri.macos.conf.json repeats the base windows and adds glass to main only', () => {
+  const mac = JSON.parse(readFileSync(join(root, 'src-tauri/tauri.macos.conf.json'), 'utf8'));
+  assert.deepEqual(Object.keys(mac).filter(k => k !== '$schema'), ['app']);
+  assert.deepEqual(Object.keys(mac.app), ['windows']);
+  const [main, popover] = mac.app.windows;
+  const glass = { transparent: true, windowEffects: { effects: ['sidebar'] }, theme: 'Dark' };
+  assert.deepEqual(main, { ...config.app.windows[0], ...glass });
+  assert.deepEqual(popover, config.app.windows[1]);
+  assert.equal(mac.app.windows.length, config.app.windows.length);
+  // Base (Linux, Windows): no glass keys on main, so Classic keeps the
+  // system title bar theme and an opaque window.
+  for (const key of Object.keys(glass)) assert.ok(!(key in config.app.windows[0]), `base main has ${key}`);
+  // macOSPrivateApi stays in the base: tauri-build checks the `tauri`
+  // features against the merged config on every platform, and the feature
+  // is not target-specific (it is a no-op off macOS).
+  assert.equal(config.app.macOSPrivateApi, true);
+});

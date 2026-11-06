@@ -3,13 +3,14 @@
     // Full, the monthly fee for 用量, 重新排列房間 (D7, not built yet), the
     // extension list (read-only, G6 registry) and 規則與授權 (D5, D9 = C:
     // only 允許 rules; core keeps no rules yet, Gap R).
-    // Native vibrancy is G10b: this page only stores `ui.glass` and the
-    // shell sets `data-glass` on `.glass-root`.
+    // This page stores `ui.glass`; the shell sets `data-glass` on
+    // `.glass-root`, or `off` while Reduce Transparency is on (G10b).
     import { onMount } from 'svelte';
     import { shell } from '$lib/data/stores/settings';
     import { fixtureOn } from '../data';
     import { DEMO_RULES } from '../model/gaps-demo';
     import { glassMode, monthlyFee, parseFee, type GlassMode } from '../prefs';
+    import { nativeGlass } from '../native';
     import { extensions, extensionsLoaded, loadExtensions } from '../ext/registry';
     import { describeEntry, type ExtEntry } from '../ext/manifest';
     import { codeParts } from './workspace-extras';
@@ -81,7 +82,11 @@
                         <button type="button" role="radio" aria-checked={$glassMode === m.id} class:on={$glassMode === m.id} data-glass-btn={m.id} on:click={() => glassMode.set(m.id)}>{m.label}</button>
                     {/each}
                 </div>
-                <p class="note">{MODES.find(m => m.id === $glassMode)?.note}。視窗本身的透明效果在下一版。</p>
+                {#if $nativeGlass.reduceTransparency}
+                    <p class="note" data-reduce-transparency>系統開了「減少透明度」，所以現在是 Off。關掉之後會回到你選的 {MODES.find(m => m.id === $glassMode)?.label}。</p>
+                {:else}
+                    <p class="note">{MODES.find(m => m.id === $glassMode)?.note}。{$nativeGlass.vibrancy ? '' : '這個視窗沒有原生玻璃，只有浮層會變。'}</p>
+                {/if}
             </div>
         </div>
     </section>

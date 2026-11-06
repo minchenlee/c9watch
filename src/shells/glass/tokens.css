@@ -86,6 +86,18 @@
 
 .glass-root[data-glass='full'] {
     --glass-bg: oklch(0.20 0.010 270 / 0.62);
+    --surface-window: oklch(0.14 0.008 270 / 0.84);
+    --text-3: #9a9ba3;
+}
+
+/* Native glass (G10b). The L0 tint above sets how much of the macOS
+ * vibrancy shows: Off 0 (opaque), Subtle 10%, Full 16%. It shows only when
+ * html and body are transparent, and native.ts adds `html.glass-native`
+ * only while the glass shell is mounted in a window with vibrancy. Classic
+ * never has the class, so its opaque black body (app.css) stays. */
+html.glass-native,
+html.glass-native body {
+    background: transparent;
 }
 
 /* Shared glass primitives. */
