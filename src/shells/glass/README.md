@@ -72,8 +72,31 @@ G4 需要你 page (read-only):
   「設計預覽，不會儲存」.
 - Disconnect banner: on a feed error (`dataError`). Demo: set
   `localStorage['c9watch.demoGlassOffline'] = '1'` with the fixture on.
-- No action sends anything yet (G5): a send button without a handler is
-  off and reads 「預覽版：還不能從這裡送出」.
+- A send button without a handler is off and reads 「預覽版：還不能從這裡送出」.
+
+G5 actions (`handling/actions.ts`, pure, `scripts/test-glass-handling.mjs`):
+
+- Answers go only to managed agents (engine, PTY): `msg.send` through the
+  shared `$lib/data/stores/mail` (`replyTo` for a 決定 that came as mail).
+  Observed sessions and 允許 get ⌘O only (`openSession`).
+- 10 s undo = delayed send (`SendQueue`): nothing is sent before the timer
+  ends. Each send has its own timer and toast (`UndoToasts.svelte`); ⌘Z
+  undoes the newest, each toast has its own 復原. A failed send is not
+  sent again; the item goes back to the queue with an error notice.
+- Leaving the 需要你 page or closing the window sends nothing: the page
+  cancels every waiting send on destroy, and the toast says so. Drafts
+  stay in memory (module state) until the window closes.
+- Stop (managed agents only): `session.stop` after a second click, then a
+  receipt. The receipt does not take ⌘↵; J goes to the 「下一件」 it names.
+- 給: c9watch does not send keys (a key sent as mail stays in the mail
+  log); 「我沒有這把 key」 can be sent.
+- Offline: nothing is kept for later. The main button is off and reads
+  「斷線了，連上後再送」.
+- Demo: the glass fixture answers `msg.send` and `session.stop` in
+  `demoTransport` (`$lib/data/demo.ts`), so demo never reaches a core.
+- Handled items (`handled` in `pages/Needs.svelte`) leave the queue, J / K
+  and the side bar count while the same need is listed.
+- `tests/glass/needs.spec.ts`: the 7 handoff §3 interaction tests.
 
 G6 extension host (`ext/`, glass build plan §3, manifest per owner D41 R1–R12):
 

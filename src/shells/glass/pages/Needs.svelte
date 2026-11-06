@@ -1,44 +1,119 @@
+<script context="module" lang="ts">
+    import { writable } from 'svelte/store';
+    import type { Answer } from '../handling/detail';
+    // Module state, so it stays when the person leaves the page and comes
+    // back (handoff test #5). Memory only: a closed window loses it.
+    // One draft per item.
+    const drafts: Record<string, Answer> = {};
+    type Receipt = { title: string; rows: [string, string][] };
+    type Done = { id: string; send: string | null; verb: string; title: string; state: 'waiting' | 'sent' | 'stopped' };
+    const kept: { receipts: Record<string, Receipt>; done: Done[] } = { receipts: {}, done: [] };
+    /** Handled items: need id → the need's title when it was handled. The
+     * queue, J / K (handoff test #4) and the side bar count skip an item
+     * while it is listed with the same title. */
+    export const handled = writable<ReadonlyMap<string, string>>(new Map());
+</script>
+
 <script lang="ts">
-    // The 需要你 page (build plan §G4, R7-SPEC §C, needs-proto.html): the
-    // queue (280px) next to the one handling panel. Read-only in G4: the
-    // panel shows every verb and ⌘O opens the chat (`openSession`, it sends
-    // nothing); sending (G5) is not wired.
+    // The 需要你 page (build plan §G4–G5, R7-SPEC §C, needs-proto.html): the
+    // queue (280px) next to the one handling panel.
+    // G5 actions:
+    // - Answer a managed agent: `msg.send` after 10 s (復原 = not sent yet).
+    // - Stop a managed agent: `session.stop`, then a receipt (no undo).
+    // - Observed sessions and 允許: ⌘O only (`openSession`).
+    // - Leaving this page or closing the window sends nothing (`onDestroy`
+    //   cancels every waiting send; the toast says so).
     import { onDestroy, onMount } from 'svelte';
+    import { get } from 'svelte/store';
+    import type { C9pSessionView } from '$lib/c9p-1';
     import { dataError, fixtureOn, model } from '../data';
-    import { usePageKeys } from '../keys';
-    import { openSession } from '$lib/data/api';
+    import { usePageKeys, type PageKeys } from '../keys';
+    import { openSession, stopSession } from '$lib/data/api';
     import { sessionFromView } from '$lib/data/session';
+    import { sendMail } from '$lib/data/stores/mail';
+    import { isDemoMode } from '$lib/data/demo/mode';
     import { DEMO_NEED_DETAILS, DEMO_OFFLINE_AGO_MS, DEMO_OFFLINE_KEY } from '../model/gaps-demo';
     import HandlingPanel from '../handling/HandlingPanel.svelte';
-    import { buildDetail, emptyAnswer, locate, waitText, type Answer } from '../handling/detail';
+    import UndoToasts from '../handling/UndoToasts.svelte';
+    import { answerBody, answerLabel, buildDetail, emptyAnswer, locate, noBody, waitText, type HandlingDetail } from '../handling/detail';
+    import { SendQueue, stepFrom, type Pending, type QueueEvent } from '../handling/actions';
 
     // Demo details only while the glass fixture is on: live mode never shows them.
     $: demo = $fixtureOn ? DEMO_NEED_DETAILS : null;
     $: needs = $model.needs;
     $: details = needs.map(n => buildDetail(n, $model.workspaces, demo));
+    $: order = details.map(d => d.id);
+
+    $: hiddenIds = new Set(needs.filter(n => $handled.get(n.id) === n.title).map(n => n.id));
+    // Forget an item once the model no longer lists it.
+    $: { const live = new Set(order); if ([...$handled.keys()].some(id => !live.has(id))) handled.set(new Map([...$handled].filter(([id]) => live.has(id)))); }
+
+    let receipts = kept.receipts;
+    $: kept.receipts = receipts;
 
     let currentId: string | null = null;
-    $: index = Math.max(0, details.findIndex(d => d.id === currentId));
-    $: current = details[index] ?? null;
-    // ⌘O: the item's session, when it has one.
-    $: chatOf = (() => {
-        const n = current ? needs.find(x => x.id === current.id) : undefined;
-        const s = n ? locate(n, $model.workspaces).member?.session : null;
-        return s ? () => openSession(sessionFromView(s)) : undefined;
-    })();
-    $: next = details.length > 1 ? details[(index + 1) % details.length] : null;
+    $: current = details.find(d => d.id === currentId && (!hiddenIds.has(d.id) || receipts[d.id])) ?? details.find(d => !hiddenIds.has(d.id)) ?? null;
+    $: index = current ? order.indexOf(current.id) : -1;
+    $: receipt = current ? receipts[current.id] ?? null : null;
+    $: nextId = current ? stepFrom(order, hiddenIds, current.id, 1) : null;
+    $: next = nextId ? details.find(d => d.id === nextId) ?? null : null;
+    $: currentNeed = current ? needs.find(x => x.id === current.id) ?? null : null;
+    $: member = currentNeed ? locate(currentNeed, $model.workspaces).member : null;
 
-    // One draft per item, so switching items keeps what was typed.
-    let answers: Record<string, Answer> = {};
+    let answers = drafts;
     $: if (current && !answers[current.id]) answers[current.id] = emptyAnswer();
 
-    // Handled items (G5 fills this). Their verbs are not orange: they no
-    // longer need you (handoff 「實作前要改的錯」 #3).
-    let handled: { id: string; verb: string; title: string }[] = [];
+    // Handled this app run, oldest first. Their verbs are not orange: they
+    // no longer need you (handoff 「實作前要改的錯」 #3).
+    let done = kept.done;
+    $: kept.done = done;
+    const STATE_TEXT: Record<Done['state'], string> = { waiting: '還沒送出，可以復原', sent: '送出了', stopped: '已停止 · 不能復原' };
 
     let now = Date.now();
-    const timer = setInterval(() => (now = Date.now()), 30_000);
-    onDestroy(() => clearInterval(timer));
+    let pending: Pending[] = [];
+    // Every second while a toast counts down, otherwise every 30 s.
+    const timer = setInterval(() => { if (pending.length || Date.now() - now >= 30_000) now = Date.now(); }, 1000);
+
+    type Notice = { id: string; text: string; tone: 'info' | 'error' };
+    let notices: Notice[] = [];
+    let nNotice = 0;
+    const noticeTimers = new Set<ReturnType<typeof setTimeout>>();
+    function notify(text: string, tone: Notice['tone']) {
+        const id = `n${++nNotice}`;
+        notices = [...notices, { id, text, tone }];
+        // An error stays until closed. Info ends on its own timer.
+        if (tone === 'info') { const t = setTimeout(() => { noticeTimers.delete(t); dismiss(id); }, 5000); noticeTimers.add(t); }
+    }
+    const dismiss = (id: string) => (notices = notices.filter(n => n.id !== id));
+
+    function unhide(itemId: string) { handled.update(m => { const n = new Map(m); n.delete(itemId); return n; }); }
+    function onQueue(e: QueueEvent) {
+        const p = e.pending;
+        if (e.kind === 'sent') {
+            done = kept.done = done.map(x => (x.send === p.id ? { ...x, state: 'sent' as const } : x));
+            delete answers[p.itemId];
+            answers = answers;
+            return;
+        }
+        done = kept.done = done.filter(x => x.send !== p.id);
+        unhide(p.itemId);
+        if (e.kind === 'cancelled') return;
+        if (e.kind === 'undone') {
+            show(p.itemId);
+            notify(`復原了：${p.label}。沒有送出。`, 'info');
+        } else {
+            notify(`沒送出：${p.label}。${e.error}。這件回到需要你，c9watch 不會自動再送。`, 'error');
+        }
+    }
+    const queue = new SendQueue(onQueue);
+    const stopQueue = queue.subscribe(l => (pending = l));
+    onDestroy(() => {
+        // Leaving the page sends nothing (stated in the toast).
+        queue.cancelAll();
+        stopQueue();
+        clearInterval(timer);
+        for (const t of noticeTimers) clearTimeout(t);
+    });
 
     // A feed error means c9watch lost the core and so every agent. The time
     // is when this page first saw it. Reconnect restarts every feed.
@@ -51,22 +126,82 @@
     }
     const reconnect = () => location.reload();
 
-    // True once the person picked an item (click, J / K). Only then may the
-    // panel take the focus.
+    // True once the person picked an item (click, J / K, a send). Only then
+    // may the panel take the focus.
     let moved = false;
-    const show = (id: string) => { moved = true; currentId = id; };
-    const go = (step: number) => {
-        if (!details.length) return;
-        show(details[(index + step + details.length) % details.length].id);
-    };
+    function show(id: string | null) { moved = true; currentId = id; }
+    function go(step: 1 | -1) {
+        const id = stepFrom(order, hiddenIds, current?.id ?? null, step);
+        // From a receipt with nothing left: the empty page.
+        if (id || (current && hiddenIds.has(current.id))) show(id);
+    }
+
+    /** Marks `d` handled and moves to the 「下一件」 the panel showed
+     * (handoff test #1). */
+    function markHandled(d: HandlingDetail, send: string | null, state: Done['state']) {
+        const to = stepFrom(order, hiddenIds, d.id, 1);
+        const title = needs.find(n => n.id === d.id)?.title ?? d.title;
+        handled.update(m => new Map(m).set(d.id, title));
+        done = [...done, { id: d.id, send, verb: d.verb, title: d.title, state }];
+        if (state !== 'stopped') show(to);
+    }
+    function schedule(d: HandlingDetail, label: string, body: string) {
+        const n = needs.find(x => x.id === d.id);
+        const to = n?.agentId;
+        if (!d.managed || !to) return;
+        const replyTo = n?.msgId ?? null;
+        now = Date.now();
+        const send = queue.schedule(d.id, label, async () => {
+            const error = await sendMail(to, body, replyTo);
+            if (error) throw new Error(error);
+        });
+        markHandled(d, send, 'waiting');
+    }
+    function submit(a: Answer) {
+        if (!current || offlineSince !== null) return;
+        const body = answerBody(current, a);
+        if (body) schedule(current, answerLabel(current, a), body);
+    }
+    function no() {
+        if (!current || offlineSince !== null) return;
+        const body = noBody(current);
+        if (body) schedule(current, `${current.verb} ${current.title} · ${current.no}`, body);
+    }
+    const undo = (id?: string) => { queue.undo(id); };
+
+    // ⌘O: the item's session, when it has one.
+    $: chatOf = member?.session ? ((s) => () => openSession(sessionFromView(s)))(member.session) : undefined;
+    // Stop: managed agents only (observed sessions get ⌘O only), with a pid
+    // the engine can stop.
+    async function stop(d: HandlingDetail, s: C9pSessionView) {
+        await stopSession(sessionFromView(s));
+        const at = new Date();
+        const rows: [string, string][] = [
+            ['做了什麼', `停止了 ${d.who} 的程式`],
+            ['程式', `pid ${s.pid}`],
+            ['時間', `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`],
+            ['能不能復原', '不能。要它再做事，請重新啟動它。']
+        ];
+        if (get(isDemoMode)) rows.push(['示範模式', '沒有真的停止任何程式']);
+        receipts = { ...receipts, [d.id]: { title: `已停止 ${d.who}`, rows } };
+        markHandled(d, null, 'stopped');
+    }
+    $: stopOf = current && current.managed && member?.session?.canStop && member.session.pid && !receipt
+        ? ((d: HandlingDetail, s: C9pSessionView) => () => stop(d, s))(current, member.session)
+        : undefined;
+
     let panel: HandlingPanel | undefined;
-    onMount(() => usePageKeys({
+    const keys: PageKeys = {
         option: n => panel?.option(n),
         submit: () => panel?.submit(),
         openChat: () => panel?.openChat(),
         next: () => go(1),
-        prev: () => go(-1)
-    }));
+        prev: () => go(-1),
+        undo: () => undo()
+    };
+    // The receipt does not accept ⌘↵ (R7-SPEC §A.2).
+    $: keys.receipt = !!receipt;
+    onMount(() => usePageKeys(keys));
 
     const rowName = (id: string) => {
         const n = needs.find(x => x.id === id);
@@ -74,12 +209,13 @@
         return r ? (r.kind === 'talk' ? `對談 · ${r.title}` : r.title) : '';
     };
     $: sortRule = needs.some(n => n.blocking != null) ? '依擋住的 agent 數排。一樣多時，等越久越前面。' : '等越久越前面。';
+    $: visible = details.filter(d => !hiddenIds.has(d.id));
 </script>
 
-<div class="needs" data-needs={details.length}>
+<div class="needs" data-needs={visible.length}>
     <aside class="queue" aria-label="需要你的事">
-        {#if details.length}<span class="rule">{sortRule}</span>{/if}
-        {#each details as d (d.id)}
+        {#if visible.length}<span class="rule">{sortRule}</span>{/if}
+        {#each visible as d (d.id)}
             <button type="button" class="qi" class:on={d.id === current?.id} aria-current={d.id === current?.id ? 'true' : undefined} on:click={() => show(d.id)} data-need={d.id}>
                 <span class="t"><span class="verb">{d.verb}</span>{d.title}</span>
                 <span class="s">{[rowName(d.id), `等了 ${waitText(d.since, now)}`, d.reversible ? '' : '不能復原'].filter(Boolean).join(' · ')}</span>
@@ -87,10 +223,11 @@
         {:else}
             <p class="empty">現在沒有事。</p>
         {/each}
-        {#if handled.length}
-            <details class="handled">
-                <summary>已處理 {handled.length} 件</summary>
-                <ul>{#each handled as h (h.id)}<li><span class="verb done">{h.verb}</span>{h.title}</li>{/each}</ul>
+        {#if done.length}
+            <details class="handled" open>
+                <summary>已處理 {done.length} 件</summary>
+                <ul>{#each done as h, i (i)}<li data-done={h.id}><span class="verb done">{h.verb}</span>{h.title}<span class="st"> · {STATE_TEXT[h.state]}</span></li>{/each}</ul>
+                <p class="redo">10 秒後就不能復原，只能「改」：送一則新指示給 agent。已經做的不會自動還原。</p>
             </details>
         {/if}
     </aside>
@@ -104,8 +241,14 @@
                 next={next ? { verb: next.verb, title: next.title } : null}
                 offline={offlineSince !== null ? { since: offlineSince } : null}
                 {now}
+                {receipt}
                 autofocus={moved}
                 onOpenChat={chatOf}
+                onSubmit={current.canAnswer && current.managed ? submit : undefined}
+                onNo={current.canAnswer && current.managed && current.no ? no : undefined}
+                onStop={stopOf}
+                onUndo={() => undo()}
+                demo={$isDemoMode}
                 ruleMode={$fixtureOn ? 'preview' : 'hidden'}
                 onReconnect={reconnect}
                 onNext={() => go(1)}
@@ -117,6 +260,7 @@
                 <p>agent 要你允許、決定、給東西或審查時，會出現在這裡。</p>
             </div>
         {/if}
+        <UndoToasts {pending} {notices} {now} demo={$isDemoMode} onUndo={id => undo(id)} onDismiss={dismiss} />
     </main>
 </div>
 
@@ -141,6 +285,9 @@
     .handled { margin: 10px var(--space-1) 0; font-size: 12px; color: var(--text-3); }
     .handled summary { cursor: pointer; text-decoration: underline; }
     .handled ul { margin: 6px 0 0; padding-left: var(--space-4); }
+    .handled li { color: var(--text-2); }
+    .handled .st { color: var(--text-3); }
+    .redo { margin: 6px 0 0; }
     .view { min-width: 0; overflow: auto; padding: 28px var(--space-4) 60px var(--space-12); }
     .none h1 { margin: 0 0 var(--space-2); font: var(--type-title); color: var(--text-1); }
     .none p { margin: 0; font: var(--type-body); color: var(--text-3); }

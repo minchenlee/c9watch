@@ -43,6 +43,11 @@ export type HandlingDetail = {
     /** False: c9watch cannot send this answer, so the main button opens the
      * chat (⌘O) and the panel says why. */
     canAnswer: boolean;
+    /** Set: the answer can be written but not sent (the main button is off
+     * and shows this text). 給: a key sent as mail stays in the mail log. */
+    sendBlock: string | null;
+    /** A managed agent: answers go out as `msg.send` (D37). */
+    managed: boolean;
 };
 
 /** What the person chose or typed. Kept per item, so a draft stays when
@@ -54,6 +59,14 @@ export const emptyAnswer = (): Answer => ({ opt: 0, free: '', reject: '', input:
 export type PrimaryState = { text: string; off: boolean; chat: boolean };
 
 export const CANNOT_ANSWER = 'c9watch 還不能直接回答';
+const OPEN_NOTE = '按 ⌘O 打開對談，在終端機回答。';
+/** 給 (build plan §G5): c9p has no method that keeps a secret, and a key sent
+ * as mail stays in the mail log. So c9watch does not send keys yet. */
+export const GIVE_BLOCK = 'c9watch 還不能存 key';
+const GIVE_NOTE = 'c9watch 還不能把 key 存進鑰匙圈。用信件送 key，key 會留在信件紀錄裡，所以這一版不送。請按 ⌘O 在終端機貼上。「我沒有這把 key」可以從這裡送。';
+/** Offline (R7-SPEC §A.8): c9watch does not keep answers for later, so the
+ * button does not promise it. */
+export const OFFLINE_TEXT = '斷線了，連上後再送';
 
 export type Located = { member: MemberView | null; workspace: WorkspaceView | null; row: RowView | null };
 
@@ -109,7 +122,7 @@ export function buildDetail(need: Need, workspaces: WorkspaceView[], demo: DemoN
         id: need.id, verb: need.verb, title: plainTitle(need, member), who, where, since: need.since,
         why: null, code: null, facts: null, shots: null, options: null,
         freeIdx: -1, freeLabel: '', rejectIdx: -1, rejectLabel: '', input: null, text: null, rule: null,
-        primary: '送出', no: null, note: '', reversible: true, canAnswer: true
+        primary: '送出', no: null, note: '', reversible: true, canAnswer: true, sendBlock: null, managed: managed(member)
     };
     // D9 = C: 「以後直接做」 only on 允許, written to the project's permissions.
     if (need.verb === '允許') {
@@ -120,15 +133,19 @@ export function buildDetail(need: Need, workspaces: WorkspaceView[], demo: DemoN
         base.canAnswer = false;
         base.reversible = false;
         base.no = null;
-        base.note = '按 ⌘O 打開對談，在終端機回答。';
+        base.note = OPEN_NOTE;
     }
     if (d) {
+        // Only a managed agent can get an answer from c9watch, demo or not.
+        if (base.canAnswer && !base.managed) return { ...base, why: d.why, code: d.code ?? null, facts: d.facts ?? null, shots: d.shots ?? null, canAnswer: false, reversible: true, note: OPEN_NOTE };
+        const give = need.verb === '給';
         return {
             ...base,
             why: d.why, code: d.code ?? null, facts: d.facts ?? null, shots: d.shots ?? null, options: d.options ?? null,
             freeIdx: d.freeIdx ?? -1, freeLabel: d.freeLabel ?? '', rejectIdx: d.rejectIdx ?? -1, rejectLabel: d.rejectLabel ?? '',
             input: d.input ?? null, primary: d.primary ?? base.primary, no: base.canAnswer ? d.no ?? null : null,
-            note: base.canAnswer ? d.note ?? '' : base.note, reversible: d.reversible
+            note: !base.canAnswer ? base.note : give ? GIVE_NOTE : d.note ?? '', reversible: d.reversible,
+            sendBlock: give ? GIVE_BLOCK : null
         };
     }
     // Live: only c9p facts.
@@ -149,7 +166,7 @@ export function buildDetail(need: Need, workspaces: WorkspaceView[], demo: DemoN
     }
     base.why = s?.latestMessage && s.latestMessage !== base.title ? s.latestMessage : null;
     base.canAnswer = false;
-    base.note = '按 ⌘O 打開對談，在終端機回答。';
+    base.note = OPEN_NOTE;
     return base;
 }
 
@@ -166,7 +183,8 @@ export function primaryState(d: HandlingDetail, a: Answer, offline: boolean): Pr
     if (isFree(d, a) && !a.free.trim()) return off('先寫你的回答');
     if (isReject(d, a) && !a.reject.trim()) return off('先寫退回原因');
     if (d.text && !a.text.trim()) return off('先寫你的回答');
-    if (offline) return { text: '先存著，連上後送出', off: false, chat: false };
+    if (offline) return off(OFFLINE_TEXT);
+    if (d.sendBlock) return off(d.sendBlock);
     let text = d.primary;
     if (d.rejectIdx >= 0) text = isReject(d, a) ? '退回並送出' : d.primary;
     else if (d.options) text = isFree(d, a) ? '送出我寫的回答' : '送出：' + d.options[a.opt].label.replace(/，.*/, '');
@@ -183,13 +201,43 @@ export function waitText(since: number, now: number): string {
     return m ? `${h} 小時 ${m} 分` : `${h} 小時`;
 }
 
+/** The text a managed agent gets for this answer (`msg.send` body), or null
+ * when nothing can be sent. */
+export function answerBody(d: HandlingDetail, a: Answer): string | null {
+    if (!d.canAnswer || d.sendBlock) return null;
+    if (isReject(d, a)) return a.reject.trim() ? `退回：${d.title}\n原因：${a.reject.trim()}` : null;
+    if (isFree(d, a)) return a.free.trim() || null;
+    if (d.options) {
+        const label = d.options[a.opt]?.label;
+        if (!label) return null;
+        return d.rejectIdx >= 0 ? `${label}：${d.title}` : `${d.title}\n我的回答：${label}`;
+    }
+    if (d.text) return a.text.trim() || null;
+    return null;
+}
+/** The body of the 「不」 button (我沒有這把 key). */
+export function noBody(d: HandlingDetail): string | null {
+    if (!d.no || !d.canAnswer) return null;
+    return d.input ? `${d.no}（${d.input.label}）。請先跳過要它的步驟。` : `${d.no}：${d.title}`;
+}
+/** What the undo toast and the handled list call this answer. */
+export function answerLabel(d: HandlingDetail, a: Answer): string {
+    let what = '';
+    if (isReject(d, a)) what = '退回';
+    else if (isFree(d, a)) what = '我寫的回答';
+    else if (d.options) what = d.options[a.opt]?.label ?? '';
+    return `${d.verb} ${d.title}${what ? ` · ${what}` : ''}`;
+}
+
 /** The label of a send button that has no handler yet (G4 is read-only). */
 export const PREVIEW_ONLY = '預覽版：還不能從這裡送出';
 
 /** Handoff test #7: in the empty key field, J / K still change item. Same
  * IME guard as keys.ts: while an input method composes (or WebKit reports
  * keyCode 229), the key belongs to the input method. */
-export function fieldStep(e: { code: string; isComposing?: boolean; keyCode?: number; metaKey?: boolean; ctrlKey?: boolean; altKey?: boolean; shiftKey?: boolean }, value: string): 1 | -1 | 0 {
-    if (value || e.isComposing || e.keyCode === 229 || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return 0;
+export function fieldStep(e: { code: string; isComposing?: boolean; keyCode?: number; metaKey?: boolean; ctrlKey?: boolean; altKey?: boolean; shiftKey?: boolean }, value: string): 1 | -1 | 0 | 'undo' {
+    if (value || e.isComposing || e.keyCode === 229 || e.altKey || e.shiftKey) return 0;
+    // ⌘Z in the empty field undoes the last send (there is no typing to undo).
+    if (e.metaKey || e.ctrlKey) return e.code === 'KeyZ' ? 'undo' : 0;
     return e.code === 'KeyJ' ? 1 : e.code === 'KeyK' ? -1 : 0;
 }

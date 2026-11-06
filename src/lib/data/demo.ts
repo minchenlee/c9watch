@@ -23,8 +23,17 @@ export function demoGlassOn(): boolean {
  * the same whatever localStorage holds. */
 let glassShellActive = false;
 export function setDemoGlassActive(on: boolean): void { glassShellActive = on; }
-function demoGlassRequest(method: C9pMethod): any {
+let demoGlassSends = 0;
+/** The glass fixture also answers the two actions the handling panel sends
+ * (build plan §G5), so demo mode never reaches a real core: `msg.send` gets
+ * a made-up id and `session.stop` stops nothing. */
+function demoGlassRequest(method: C9pMethod, p: any): any {
     switch (method) {
+        case 'msg.send': {
+            const n = ++demoGlassSends;
+            return { cursor: `demo:glass:send:${n}`, msgId: `msg_demo_glass_${n}`, paused: false, replayed: false, state: 'queued', to: { addr: `demo/${p.to}`, id: p.to, name: null } };
+        }
+        case 'session.stop': return {};
         case 'session.views': return { sessions: glassDemoSessionViews(), cursor: 'demo:glass:0' };
         case 'agent.list': return { agents: glassDemoAgents() };
         case 'annotation.list': return { annotations: glassDemoAnnotations(), cursor: 'demo:glass:0' };
@@ -37,7 +46,7 @@ function demoGlassRequest(method: C9pMethod): any {
 const mailDenied = () => Object.assign(new Error('Mail is not exposed in demo mode'), { code: 'not_allowed', msg: 'Mail is not exposed in demo mode' });
 export const demoTransport: Transport = {
     async request(method: C9pMethod, p: any): Promise<any> {
-        const glass = glassShellActive && demoGlassOn() ? demoGlassRequest(method) : undefined;
+        const glass = glassShellActive && demoGlassOn() ? demoGlassRequest(method, p) : undefined;
         if (glass !== undefined) return glass;
         switch (method) {
             case 'session.views': return { sessions: getDemoSessions(), cursor: null };

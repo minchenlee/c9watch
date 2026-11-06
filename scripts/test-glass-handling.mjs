@@ -26,7 +26,8 @@ const { deriveGlassModel } = await load('./model', M + 'index.ts');
 const fixture = await load('$lib/data/demo/glass', '../src/lib/data/demo/glass.ts');
 const gaps = await load('../model/gaps-demo', M + 'gaps-demo.ts');
 urls['./gaps-demo'] = urls['../model/gaps-demo'];
-const { buildDetail, primaryState, emptyAnswer, waitText, fieldStep } = await load('./detail', '../src/shells/glass/handling/detail.ts');
+const { buildDetail, primaryState, emptyAnswer, waitText, fieldStep, answerBody, answerLabel, noBody } = await load('./detail', '../src/shells/glass/handling/detail.ts');
+const { SendQueue, secondsLeft, stepFrom } = await load('./actions', '../src/shells/glass/handling/actions.ts');
 
 const NOW = 1_800_000_000_000;
 const GAPS = { workspaces: gaps.DEMO_WORKSPACES, goals: gaps.DEMO_GOALS, needs: gaps.DEMO_NEEDS };
@@ -69,16 +70,43 @@ test('the main button says what ⌘↵ does; typing never changes the option', (
     assert.equal(primaryState(decide, { ...a, opt: 3 }, false).text, '先寫你的回答');
     assert.equal(primaryState(decide, { ...a, opt: 3, free: 'ok' }, false).text, '送出我寫的回答');
     assert.deepEqual(primaryState(give, a, false), { text: '先貼上 key', off: true, chat: false });
-    assert.equal(primaryState(give, { ...a, input: 'k' }, false).text, '存入 key（不能復原）');
+    // G5: a key is never sent as mail (it would stay in the mail log).
+    assert.deepEqual(primaryState(give, { ...a, input: 'k' }, false), { text: 'c9watch 還不能存 key', off: true, chat: false });
+    assert.equal(answerBody(give, { ...a, input: 'k' }), null);
     assert.equal(give.reversible, false);
 });
 
-test('offline: the main button keeps the answer for later, but an empty answer stays off', () => {
+test('offline: nothing is kept for later, so the main button is off and says so', () => {
     const list = demoDetails();
     const a = emptyAnswer();
-    assert.equal(primaryState(byVerb(list, '處理'), a, true).text, '先存著，連上後送出');
+    assert.deepEqual(primaryState(byVerb(list, '處理'), a, true), { text: '斷線了，連上後再送', off: true, chat: false });
     assert.equal(primaryState(byVerb(list, '給'), a, true).off, true);
-    assert.equal(primaryState(byVerb(list, '給'), { ...a, input: 'k' }, true).text, '先存著，連上後送出');
+    for (const d of list) assert(!primaryState(d, { ...a, input: 'k', free: 'x', reject: 'x', text: 'x' }, true).text.includes('先存著'));
+});
+
+test('demo: answers go only to managed agents; the observed talk is ⌘O only', () => {
+    const list = demoDetails();
+    for (const v of ['審', '決定', '處理', '給']) assert.equal(byVerb(list, v).managed, true, v);
+    const allow = byVerb(list, '允許');
+    assert.equal(allow.managed, false);
+    assert.equal(allow.canAnswer, false);
+    assert.equal(answerBody(allow, emptyAnswer()), null);
+});
+
+test('answer bodies and labels', () => {
+    const list = demoDetails();
+    const a = emptyAnswer();
+    const review = byVerb(list, '審'), decide = byVerb(list, '決定'), fix = byVerb(list, '處理'), give = byVerb(list, '給');
+    assert.equal(answerBody(review, a), '驗收：MONITOR 改用新詞表');
+    assert.equal(answerBody(review, { ...a, opt: 1 }), null);
+    assert.equal(answerBody(review, { ...a, opt: 1, reject: ' 太長 ' }), '退回：MONITOR 改用新詞表\n原因：太長');
+    assert.equal(answerBody(decide, a), '要不要改狀態色？\n我的回答：只有「需要你」上色，其他用灰階');
+    assert.equal(answerBody(decide, { ...a, opt: 3, free: '先改 AGENTS' }), '先改 AGENTS');
+    assert.equal(answerBody(fix, { ...a, opt: 2 }), '匯出 CSV 的測試環境\n我的回答：先跳過這一項');
+    assert.equal(answerLabel(review, { ...a, opt: 1 }), '審 MONITOR 改用新詞表 · 退回');
+    assert.equal(answerLabel(fix, a), '處理 匯出 CSV 的測試環境 · 測試改用 5433 port');
+    assert.equal(noBody(give), '我沒有這把 key（STAGING_API_KEY）。請先跳過要它的步驟。');
+    assert.equal(noBody(review), null);
 });
 
 test('live: no demo text; an observed session can only be answered in its terminal', () => {
@@ -129,4 +157,86 @@ test('key field: J / K step only when empty and no input method composes', () =>
     assert.equal(fieldStep({ code: 'KeyK', isComposing: true }, ''), 0);
     assert.equal(fieldStep({ code: 'KeyJ', metaKey: true }, ''), 0);
     assert.equal(fieldStep({ code: 'KeyA' }, ''), 0);
+    // ⌘Z in the empty field undoes the last send; with text it is typing undo.
+    assert.equal(fieldStep({ code: 'KeyZ', metaKey: true }, ''), 'undo');
+    assert.equal(fieldStep({ code: 'KeyZ', metaKey: true }, 'k'), 0);
+    assert.equal(fieldStep({ code: 'KeyZ', metaKey: true, isComposing: true }, ''), 0);
+});
+
+/** Fake timers for SendQueue. */
+function fakeTimers() {
+    let t = 0, n = 0;
+    const due = new Map();
+    return {
+        now: () => t,
+        set: (fn, ms) => { const id = ++n; due.set(id, { at: t + ms, fn }); return id; },
+        clear: id => { due.delete(id); },
+        async advance(ms) {
+            t += ms;
+            for (const [id, x] of [...due].sort((a, b) => a[1].at - b[1].at)) if (x.at <= t) { due.delete(id); x.fn(); }
+            for (let i = 0; i < 5; i++) await Promise.resolve();
+        }
+    };
+}
+
+test('send queue: nothing is sent before 10 s; undo inside 10 s sends nothing', async () => {
+    const tm = fakeTimers(), events = [], sent = [];
+    const q = new SendQueue(e => events.push(e.kind), tm);
+    q.schedule('a', 'A', async () => { sent.push('a'); });
+    await tm.advance(9_999);
+    assert.deepEqual(sent, []);
+    assert.equal(q.undo()?.itemId, 'a');
+    await tm.advance(10_000);
+    assert.deepEqual(sent, []);
+    assert.deepEqual(events, ['undone']);
+    assert.equal(q.list.length, 0);
+});
+
+test('send queue: timers never overwrite each other (handoff tests #2, #3)', async () => {
+    const tm = fakeTimers(), sent = [];
+    const q = new SendQueue(() => {}, tm);
+    const a = q.schedule('a', 'A', async () => { sent.push('a'); });
+    await tm.advance(4_000);
+    q.schedule('b', 'B', async () => { sent.push('b'); });
+    assert.deepEqual(q.list.map(p => p.itemId), ['a', 'b']);
+    // ⌘Z takes the newest; the older one keeps its own deadline.
+    assert.equal(q.undo()?.itemId, 'b');
+    assert.equal(secondsLeft(q.list[0], tm.now()), 6);
+    await tm.advance(6_000);
+    assert.deepEqual(sent, ['a']);
+    assert.equal(q.undo(a), null);
+});
+
+test('send queue: undo by id; a failure is reported once and not sent again; cancelAll sends nothing', async () => {
+    const tm = fakeTimers(), events = [];
+    let calls = 0;
+    const q = new SendQueue(e => events.push([e.kind, e.pending.itemId, e.error]), tm);
+    const a = q.schedule('a', 'A', async () => { calls++; throw { code: 'unavailable', msg: 'core is gone' }; });
+    const b = q.schedule('b', 'B', async () => { calls++; });
+    q.undo(a);
+    assert.deepEqual(q.list.map(p => p.id), [b]);
+    q.schedule('c', 'C', async () => { calls++; throw new Error('boom'); });
+    await tm.advance(10_000);
+    assert.deepEqual(events, [['undone', 'a', undefined], ['sent', 'b', undefined], ['failed', 'c', 'boom']]);
+    assert.equal(calls, 2);
+    await tm.advance(60_000);
+    assert.equal(calls, 2);
+    q.schedule('d', 'D', async () => { calls++; });
+    assert.equal(q.has('d'), true);
+    assert.equal(q.cancelAll().length, 1);
+    await tm.advance(10_000);
+    assert.equal(calls, 2);
+});
+
+test('stepFrom: J / K skip handled items; a receipt moves on from where it was', () => {
+    const order = ['a', 'b', 'c', 'd'];
+    assert.equal(stepFrom(order, new Set(), 'a', 1), 'b');
+    assert.equal(stepFrom(order, new Set(['b']), 'a', 1), 'c');
+    assert.equal(stepFrom(order, new Set(['b', 'c']), 'd', -1), 'a');
+    assert.equal(stepFrom(order, new Set(['d']), 'c', 1), 'a');
+    // 'b' is handled and shows its receipt: J goes to the item after it, not to the first.
+    assert.equal(stepFrom(order, new Set(['a', 'b']), 'b', 1), 'c');
+    assert.equal(stepFrom(order, new Set(['a', 'b', 'c', 'd']), 'b', 1), null);
+    assert.equal(stepFrom(order, new Set(), null, 1), 'a');
+    assert.equal(stepFrom(order, new Set(), null, -1), 'd');
 });

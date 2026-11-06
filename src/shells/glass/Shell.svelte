@@ -12,15 +12,15 @@
     import { glassMode, sidebarCollapsed } from './prefs';
     import Sidebar from './Sidebar.svelte';
     import Workspace from './pages/Workspace.svelte';
-    import Needs from './pages/Needs.svelte';
+    import Needs, { handled } from './pages/Needs.svelte';
     import ExtPages from './ext/ExtPages.svelte';
 
     // startGlassData returns its stop function, which Svelte runs on unmount.
     onMount(startGlassData);
 
     // The same list the 需要你 page shows (G2 model; demo verbs only while
-    // the fixture is on).
-    $: needs = $model.needs.length;
+    // the fixture is on), less the items handled there (G5).
+    $: needs = $model.needs.filter(n => $handled.get(n.id) !== n.title).length;
 
     // ⌘N and ⌘K show a hint. v1 has no delegate composer (owner D40) and
     // search comes later.
