@@ -1,0 +1,138 @@
+/* Glass tokens (ui-refactor-direction §2.2). Scoped to .glass-root, never
+ * :root, so Classic never sees them. `data-glass` on .glass-root picks
+ * Off / Subtle (default) / Full. scripts/test-glass-tokens.mjs reads this
+ * file and checks the text contrast: keep one `--name: value;` per line. */
+
+.glass-root {
+    /* Surfaces and glass. L0 window, L1 content, L2 floating. */
+    --surface-window: oklch(0.14 0.008 270 / 0.90);
+    --surface-window-solid: oklch(0.14 0.008 270);
+    --surface-1: oklch(0.18 0.008 270 / 0.92);
+    --surface-1-hover: oklch(0.21 0.008 270 / 0.94);
+    --surface-2: oklch(0.22 0.008 270 / 0.94);
+    --glass-bg: oklch(0.20 0.010 270 / 0.74);
+    --glass-blur: 32px;
+    --glass-filter: blur(var(--glass-blur)) saturate(150%);
+    --glass-stroke: rgb(255 255 255 / 0.10);
+    --glass-highlight: inset 0 1px 0 rgb(255 255 255 / 0.06);
+    --glass-shadow: 0 12px 40px rgb(0 0 0 / 0.45);
+    --fill-hover: rgb(255 255 255 / 0.05);
+    --fill-active: rgb(255 255 255 / 0.08);
+    --divider: rgb(255 255 255 / 0.06);
+    --scrim: rgb(0 0 0 / 0.55);
+
+    /* Text: three levels, plus disabled (not for information). */
+    --text-1: #ececee;
+    --text-2: #a8a9b0;
+    --text-3: #8a8b93;
+    --text-disabled: #5c5d64;
+
+    /* Status. Dot and bar / text / glow. Orange means "needs you" only. */
+    --status-working: #8b5cf6;
+    --status-working-text: #b79cff;
+    --status-working-glow: rgb(139 92 246 / 0.18);
+    --status-permission: #ff6a1a;
+    --status-permission-text: #ff8a4c;
+    --status-permission-glow: rgb(255 106 26 / 0.22);
+    --status-input: #2ee6a0;
+    --status-input-text: #5cf0b8;
+    --status-input-glow: rgb(46 230 160 / 0.16);
+    --status-idle: #6b6c74;
+    --status-idle-text: var(--text-3);
+    --status-error: #ff5c5c;
+    --status-error-text: #ff8080;
+
+    /* Fonts. Pixel only for status, section headers, numbers and tags. */
+    --font-ui: 'Geist', -apple-system, BlinkMacSystemFont, 'PingFang TC', sans-serif;
+    --font-data: 'Geist Mono', 'SF Mono', Menlo, 'PingFang TC', monospace;
+    --font-pixel: 'Geist Pixel Square', var(--font-data);
+
+    /* Six type sizes, 12px minimum. Use as `font: var(--type-body)`. */
+    --type-display: 500 28px/32px var(--font-pixel);
+    --type-title: 600 18px/24px var(--font-ui);
+    --type-heading: 600 15px/20px var(--font-ui);
+    --type-body: 400 14px/21px var(--font-ui);
+    --type-body-l2: 500 14px/21px var(--font-ui);
+    --type-meta: 400 13px/18px var(--font-data);
+    --type-label: 500 12px/16px var(--font-ui);
+    --type-section: 400 16px/20px var(--font-pixel);
+
+    /* Radius, space, shadow, focus. */
+    --radius-sm: 4px;
+    --radius-md: 8px;
+    --radius-lg: 14px;
+    --radius-xl: 20px;
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 20px;
+    --space-6: 24px;
+    --space-8: 32px;
+    --space-12: 48px;
+    --shadow-card: none;
+    --shadow-float: var(--glass-highlight), var(--glass-shadow);
+    --focus-ring: 0 0 0 2px var(--surface-window-solid), 0 0 0 4px #9d8cff;
+
+    color-scheme: dark;
+}
+
+/* Glass Off (and Reduce Transparency, G10): solid surfaces, no blur. */
+.glass-root[data-glass='off'] {
+    --glass-bg: var(--surface-2);
+    --glass-filter: none;
+    --surface-window: var(--surface-window-solid);
+}
+
+.glass-root[data-glass='full'] {
+    --glass-bg: oklch(0.20 0.010 270 / 0.62);
+}
+
+/* Shared glass primitives. */
+.glass-root :focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
+}
+
+.glass-root .state-msg {
+    margin: 0;
+    padding: var(--space-6) var(--space-3);
+    font: var(--type-meta);
+    color: var(--text-3);
+    text-align: center;
+}
+
+.glass-root .glass-float {
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-filter);
+    -webkit-backdrop-filter: var(--glass-filter);
+    border: 1px solid var(--glass-stroke);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-float);
+    font: var(--type-body-l2);
+    color: var(--text-1);
+}
+
+/* The "needs you" square dot and count. Orange only while N > 0. */
+.glass-root .need-dot {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    background: rgb(255 255 255 / 0.2);
+}
+.glass-root .need-dot.on {
+    background: var(--status-permission);
+}
+.glass-root .need-n {
+    font: var(--type-meta);
+    color: var(--text-3);
+}
+.glass-root .need-n.on {
+    color: var(--status-permission-text);
+}
+
+.glass-root kbd {
+    font: var(--type-meta);
+    font-size: 12px;
+    color: var(--text-3);
+}

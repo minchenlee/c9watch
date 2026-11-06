@@ -47,10 +47,50 @@ test.describe('glass preview (not a baseline)', () => {
 		await shot(page, 'glass-frame');
 	});
 
+	test('side bar: needs count, lead and talk rows, no office entry', async ({ page }) => {
+		await page.setViewportSize({ width: 1100, height: 700 });
+		await openClassic(page, glass);
+		const side = page.locator('.glass-side');
+		await expect(side.locator('[data-nav="needs"] .need-n')).toHaveText('5');
+		await expect(side.getByText('lead-terms', { exact: true })).toBeVisible();
+		await expect(side.getByText('對談 · main', { exact: true })).toBeVisible();
+		await expect(side.getByText('辦公室平面圖')).toHaveCount(0);
+		await expect(side.locator('[data-slot="extensions"]')).toBeEmpty();
+		await shot(page, 'g1-sidebar-open');
+	});
+
+	test('[ collapses the side bar to a "需要你 · N" button and back', async ({ page }) => {
+		await page.setViewportSize({ width: 1100, height: 700 });
+		await openClassic(page, glass);
+		await page.keyboard.press('BracketLeft');
+		await expect(page.locator('.glass-side')).toHaveCount(0);
+		await expect(page.locator('.reopen')).toHaveText(/需要你 · 5/);
+		await shot(page, 'g1-sidebar-collapsed');
+		await page.locator('.reopen').click();
+		await expect(page.locator('.glass-side')).toBeVisible();
+	});
+
+	test('⌘N shows the spawn hint; Esc closes it', async ({ page }) => {
+		await page.setViewportSize({ width: 1100, height: 700 });
+		await openClassic(page, glass);
+		await page.keyboard.press('Meta+KeyN');
+		await expect(page.locator('.hint')).toContainText('c9watch spawn');
+		await shot(page, 'g1-delegate-hint');
+		await page.keyboard.press('Escape');
+		await expect(page.locator('.hint')).toHaveCount(0);
+	});
+
+	test('Glass Off: solid surfaces', async ({ page }) => {
+		await page.setViewportSize({ width: 1100, height: 700 });
+		await openClassic(page, { storage: { ...glass.storage, 'ui.glass': 'off' } });
+		await expect(page.locator('.glass-root')).toHaveAttribute('data-glass', 'off');
+		await shot(page, 'g1-glass-off');
+	});
+
 	test('hash opens a page directly', async ({ page }) => {
 		await openClassic(page, { ...glass, path: '/#/ws/c9watch' });
 		await expect(page.locator('.glass-root')).toHaveAttribute('data-page', 'ws/c9watch');
-		await page.locator('.glass-side a', { hasText: 'Settings' }).click();
+		await page.locator('.glass-side a', { hasText: '設定' }).click();
 		await expect(page.locator('.glass-root')).toHaveAttribute('data-page', 'settings');
 	});
 
@@ -67,7 +107,7 @@ test.describe('glass preview (not a baseline)', () => {
 	test('live mode shows no demo workspaces', async ({ page }) => {
 		await openClassic(page, { storage: { 'ui.shell': 'glass' } });
 		const side = page.locator('.glass-side');
-		await expect(side.locator('.state-msg')).toHaveText(/no workspaces yet/i);
+		await expect(side.locator('.state-msg')).toHaveText('還沒有 workspace');
 		for (const name of ['C9WATCH', 'FLOCKBOOK', 'JUMPMARK', '跨專案']) await expect(side.getByText(name, { exact: true })).toHaveCount(0);
 		await shot(page, 'glass-frame-live');
 	});
