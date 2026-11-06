@@ -39,6 +39,11 @@ export type Need = {
     source: 'session' | 'attention' | 'mail' | 'demo';
     permission: PermissionAsk | null;
     msgId: string | null;
+    /** This one request, not just this member: `id` stays the same for every
+     * request of one member. A mail request is its `msgId`; an attention
+     * event is its key and time; a session prompt is its session, agent
+     * generation, verb and text. Handled marks, drafts and receipts use it. */
+    instance: string;
 };
 
 /** `at`: the event's time. `receivedAt`: local time it arrived, compared
@@ -106,9 +111,11 @@ export type NeedsInput = {
 export function deriveNeeds({ members, workspaceOf, attention = [], mail = [], demo = null }: NeedsInput): Need[] {
     const byKey = new Map<string, Need>();
     const byAgent = new Map(members.filter(m => m.agentId).map(m => [m.agentId!, m]));
-    const add = (m: Member, n: Omit<Need, 'id' | 'memberKey' | 'agentId' | 'sessionKey' | 'workspaceId' | 'blocking' | 'tag' | 'msgId'> & { msgId?: string | null }) => {
+    const add = (m: Member, n: Omit<Need, 'id' | 'memberKey' | 'agentId' | 'sessionKey' | 'workspaceId' | 'blocking' | 'tag' | 'msgId' | 'instance'> & { msgId?: string | null; event?: string }) => {
         if (byKey.has(m.key)) return;
-        byKey.set(m.key, { id: `need:${m.key}`, memberKey: m.key, agentId: m.agentId, sessionKey: m.sessionKey, workspaceId: workspaceOf(m), blocking: null, tag: TAG[n.verb], msgId: null, ...n });
+        const { event, ...rest } = n;
+        const instance = n.msgId ? `mail:${n.msgId}` : event ? `event:${event}` : `${n.source}:${m.key}|g${m.agent?.generation ?? 0}|${n.verb}|${n.title}`;
+        byKey.set(m.key, { id: `need:${m.key}`, memberKey: m.key, agentId: m.agentId, sessionKey: m.sessionKey, workspaceId: workspaceOf(m), blocking: null, tag: TAG[n.verb], msgId: null, ...rest, instance });
     };
 
     for (const m of members) {
@@ -129,18 +136,23 @@ export function deriveNeeds({ members, workspaceOf, attention = [], mail = [], d
     // Newest open event first, whatever the detected status says.
     for (const { event, at } of [...attention].sort((a, b) => b.at - a.at)) {
         const m = byAgent.get(event.id);
-        if (m?.live) add(m, { verb: '處理', title: event.reason, since: at, source: 'attention', permission: null, msgId: event.msgId ?? null });
+        if (m?.live) add(m, { verb: '處理', title: event.reason, since: at, source: 'attention', permission: null, msgId: event.msgId ?? null, event: `${attentionKey(event)}|g${event.generation ?? ''}@${at}` });
     }
     const humans = new Set(members.filter(m => m.role === 'human').map(m => m.agentId));
-    // Answered: a reply from the request's recipient (the human side) that
-    // was not lost. Engine notices and failed or cancelled replies never count.
+    // Answered: a mail whose `replyTo` names the request, sent by the side
+    // that was asked (a human, or the recipient agent) to the request's
+    // sender, and not lost. The
+    // engine stores a reply with any kind (`info` by default), so the kind
+    // does not count. Engine notices and failed or cancelled replies never count.
+    const named = (name: string | null) => { const hit = name ? members.filter(m => m.agentId && m.name === name) : []; return hit.length === 1 ? hit[0] : undefined; };
     const byId = new Map(mail.map(x => [x.msgId, x]));
     const answered = new Set(mail.filter(r => {
         const q = r.replyTo ? byId.get(r.replyTo) : undefined;
-        return q && r.kind === 'reply' && !LOST_REPLY.has(r.state) && r.from.kind !== 'engine'
+        if (!q || LOST_REPLY.has(r.state) || r.from.kind === 'engine') return false;
+        const sender = agentIdOf(q.from.addr) ?? named(q.from.name)?.agentId ?? null;
+        return sender !== null && r.to.id === sender
             && (r.from.kind === 'human' || agentIdOf(r.from.addr) === q.to.id);
     }).map(r => r.replyTo));
-    const named = (name: string | null) => { const hit = name ? members.filter(m => m.agentId && m.name === name) : []; return hit.length === 1 ? hit[0] : undefined; };
     for (const x of mail) {
         if (x.kind !== 'request' || !humans.has(x.to.id) || CLOSED_MAIL.has(x.state) || answered.has(x.msgId)) continue;
         // By address; a name only when there is no address and it is unique.
@@ -154,7 +166,7 @@ export function deriveNeeds({ members, workspaceOf, attention = [], mail = [], d
         if (!m) continue;
         const had = byKey.get(m.key);
         byKey.delete(m.key);
-        add(m, { verb: d.verb, title: d.title, since: had?.since ?? m.seenAt, source: had?.source ?? 'demo', permission: had?.permission ?? null, msgId: had?.msgId ?? null });
+        add(m, { verb: d.verb, title: d.title, since: had?.since ?? m.seenAt, source: had?.source ?? 'demo', permission: had?.permission ?? null, msgId: had?.msgId ?? null, event: had?.instance });
         byKey.get(m.key)!.tag = d.tag;
     }
     return [...byKey.values()];

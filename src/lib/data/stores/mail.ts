@@ -71,11 +71,12 @@ function message(error: unknown): string {
 }
 
 /** Each action returns null on success, or the error text to show. */
-export async function sendMail(to: string, body: string): Promise<string | null> {
+/** `replyTo`: the request this mail answers (a 決定 from mail, glass G5). */
+export async function sendMail(to: string, body: string, replyTo: string | null = null): Promise<string | null> {
     try {
-        const result = await transport().request('msg.send', { to, body });
+        const result = await transport().request('msg.send', replyTo ? { to, body, replyTo } : { to, body });
         ownMail.update(s => new Set(s).add(result.msgId));
-        feed?.upsert(rowFromSend(result, body, Date.now()));
+        feed?.upsert({ ...rowFromSend(result, body, Date.now()), replyTo });
         if (result.paused) {
             pauseSetAt.set(result.to.id, Date.now());
             pausedAgents.update(s => new Set(s).add(result.to.id));

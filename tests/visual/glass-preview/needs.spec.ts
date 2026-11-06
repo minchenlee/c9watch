@@ -2,7 +2,8 @@ import { test, expect, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { openClassic, settle, expectNoUnhandledCommands } from '../harness/classic';
 
-// G4: the 需要你 page and the one handling panel. Preview only, no baseline.
+// G4–G5: the 需要你 page and the one handling panel. Preview only, no baseline.
+// The 7 handoff interaction tests are in tests/glass/needs.spec.ts.
 const glass = { 'ui.shell': 'glass', demoMode: 'true', 'c9watch.demoGlass': '1' };
 const out = (name: string) => fileURLToPath(new URL(`../.cache/glass-preview/${name}.png`, import.meta.url));
 
@@ -19,15 +20,25 @@ async function openNeeds(page: Page, storage: Record<string, string> = glass, se
 }
 /** Live mode on the Classic visual fixture. Its rows predate `sessionKey`,
  * which every c9p `SessionView` has; this adds it. `failAgentList` rejects
- * `agent.list`, as when the core is gone. Runs before the IPC mock. */
-async function live(page: Page, failAgentList = false) {
-	await page.addInitScript((fail) => {
+ * `agent.list`, as when the core is gone. `managed` makes the question
+ * session (pid 41003) a managed engine agent and lets `msg.send` through
+ * (the shared IPC mock refuses mail). `slowStop` holds `session.stop` until
+ * the page calls `__C9_RELEASE_STOP__()`. Runs before the IPC mock. */
+const MANAGED = { id: 'agt_01VISUALMANAGED', sessionKey: 'claudeCode:0b6c1f0e-1111-4a2b-9c3d-000000000003' };
+async function live(page: Page, failAgentList = false, managed = false, slowStop = false) {
+	await page.addInitScript(([fail, managed, M, slow]) => {
 		const internals: Record<string, unknown> = {};
 		let inner: ((cmd: string, args: any, o?: unknown) => unknown) | undefined;
 		const calls: { cmd: string; args: any }[] = ((window as any).__C9_CALLS__ = []);
 		const call = async (cmd: string, args: any, o?: unknown) => {
 			calls.push({ cmd, args });
 			if (fail && cmd === 'c9p_request' && args?.method === 'agent.list') throw { code: 'unavailable', msg: 'core is gone', retryable: true, hint: '' };
+			if (managed && cmd === 'c9p_request' && args?.method === 'agent.list')
+				return { agents: [{ id: M.id, sessionKey: M.sessionKey, name: 'w-cache', role: 'worker', parentId: null, cwd: '/Users/visual/projects/api-server', source: 'engine', control: 'pty', mode: 'managed', state: 'ready', status: 'needs_attention', generation: 1, goneAt: null, lastSeen: Date.now(), createdAt: Date.now() - 3_600_000, mailPaused: false }] };
+			if (managed && cmd === 'c9p_request' && args?.method === 'msg.send')
+				return { cursor: 'visual:send:1', msgId: 'msg_01VISUAL', paused: false, replayed: false, state: 'queued', to: { addr: `m/${args.params.to}`, id: args.params.to, name: 'w-cache' } };
+			if (slow && cmd === 'c9p_request' && args?.method === 'session.stop')
+				return new Promise(res => ((window as any).__C9_RELEASE_STOP__ = () => res(inner!(cmd, args, o))));
 			const r: any = await inner!(cmd, args, o);
 			if (cmd === 'c9p_request' && args?.method === 'session.views' && r?.sessions)
 				return { ...r, sessions: r.sessions.map((s: any) => ({ sessionKey: `${s.provider}:${s.id}`, ...s })) };
@@ -35,9 +46,10 @@ async function live(page: Page, failAgentList = false) {
 		};
 		Object.defineProperty(internals, 'invoke', { configurable: true, get: () => call, set: (fn) => { inner = fn; } });
 		(window as any).__TAURI_INTERNALS__ = internals;
-	}, failAgentList);
+	}, [failAgentList, managed, MANAGED, slowStop] as const);
 }
-const PREVIEW = '預覽版：還不能從這裡送出';
+const calls = (page: Page, method: string) => page.evaluate((m) => (window as any).__C9_CALLS__.filter((c: any) => c.cmd === 'c9p_request' && c.args?.method === m).map((c: any) => c.args.params), method);
+const MUTATING = ['msg.send', 'session.stop', 'msg.cancel', 'mail.pause', 'mail.resume'];
 const panel = (page: Page) => page.locator('.handling');
 const pick = (page: Page, verb: string) => page.locator('.queue .qi', { has: page.locator('.verb', { hasText: verb }) }).click();
 
@@ -62,9 +74,10 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await expect(p).toHaveAttribute('data-verb', '審');
 		await expect(p.locator('figcaption')).toContainText(['改前', '改後 · verifier 通過 · 3 個檔案 +42 −18']);
 		await expect(p.locator('.opt')).toHaveCount(2);
-		// G4 sends nothing: the send button is off and says so.
-		await expect(p.locator('[data-primary]')).toHaveText(new RegExp(PREVIEW));
-		await expect(p.locator('[data-primary]')).toBeDisabled();
+		// G5: a managed agent; the main button says what ⌘↵ does.
+		await expect(p.locator('[data-primary]')).toContainText('驗收');
+		await expect(p.locator('[data-primary]')).toBeEnabled();
+		await expect(p.locator('.note')).toContainText('示範模式：不會真的送出或停止。');
 		await expect(p.locator('.grant')).toHaveCount(0); // D9 = C: only 允許 has the toggle
 		await page.keyboard.press('Digit2');
 		await expect(p.locator('textarea')).toBeFocused();
@@ -81,7 +94,7 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await expect(p.locator('.shot')).toHaveCount(2);
 		await expect(p.locator('.opt')).toHaveCount(4);
 		await expect(p.locator('.opt.on')).toContainText('只有「需要你」上色');
-		await expect(p.locator('[data-primary]')).toHaveText(new RegExp(PREVIEW));
+		await expect(p.locator('[data-primary]')).toContainText('送出：只有「需要你」上色');
 		await expect(p.locator('.grant')).toHaveCount(0);
 		await shot(page, 'g4-verb-decide');
 		await page.keyboard.press('Digit4');
@@ -106,8 +119,9 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		const key = p.locator('input[type="password"]');
 		await expect(key).toBeFocused();
 		await expect(p.locator('[data-primary]')).toBeDisabled();
-		await expect(p.locator('[data-primary]')).toHaveText(new RegExp(PREVIEW));
-		await expect(p.getByRole('button', { name: '我沒有這把 key' })).toBeDisabled();
+		await expect(p.locator('[data-primary]')).toContainText('先貼上 key');
+		// The 「不」 answer can be sent; a key cannot (G5).
+		await expect(p.getByRole('button', { name: '我沒有這把 key' })).toBeEnabled();
 		await expect(p.locator('.grant')).toHaveCount(0);
 		await shot(page, 'g4-verb-give');
 		// Handoff test #7: an empty field does not eat J.
@@ -166,8 +180,13 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		const p = panel(page);
 		await expect(p.locator('[data-offline]')).toContainText('和 agent 斷線了 · 2 分前');
 		await expect(p.getByRole('button', { name: '重新連線' })).toBeVisible();
-		await expect(p.locator('[data-primary]')).toHaveText(new RegExp(PREVIEW));
-		await expect(p.locator('[data-primary]')).not.toContainText('先存著');
+		// Nothing is kept for later, so nothing promises it.
+		await expect(p.locator('[data-primary]')).toContainText('斷線了，連上後再送');
+		await expect(p.locator('[data-primary]')).toBeDisabled();
+		await expect(p.locator('[data-stop]')).toBeDisabled();
+		await expect(page.locator('.glass-root')).not.toContainText('先存著');
+		await page.keyboard.press('Meta+Enter');
+		await expect(page.locator('[data-undo]')).toHaveCount(0);
 		await shot(page, 'g4-disconnected');
 	});
 
@@ -209,5 +228,143 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await live(page, true);
 		await openNeeds(page, { 'ui.shell': 'glass' });
 		await expect(panel(page).locator('[data-offline]')).toContainText('和 agent 斷線了 · 剛剛');
+	});
+	test('G5 demo: the undo toast and the receipt; no mutating call reaches the IPC', async ({ page }) => {
+		await live(page); // only to record the IPC calls; demoMode stays on
+		await openNeeds(page);
+		await pick(page, '審');
+		await page.keyboard.press('Meta+Enter');
+		await pick(page, '決定');
+		await page.keyboard.press('Meta+Enter');
+		await page.clock.runFor(3_000);
+		await expect(page.locator('[data-undo]')).toHaveCount(2);
+		await expect(page.locator('[data-leave-rule]')).toContainText('離開這一頁、關掉或縮小視窗就不送');
+		await shot(page, 'g5-undo-toast');
+		await pick(page, '處理');
+		await panel(page).locator('[data-stop]').click();
+		await expect(panel(page).locator('[data-confirm-stop]')).toContainText('不能復原');
+		await panel(page).locator('[data-stop-confirm]').click();
+		const r = panel(page);
+		await expect(r.locator('.card h2')).toHaveText('✓ 已停止 w-export');
+		await expect(r.locator('.kv')).toContainText('沒有真的停止任何程式');
+		await expect(r).toContainText('收據頁不接受 ⌘↵，免得連按跳過。');
+		await shot(page, 'g5-receipt');
+		// The receipt does not take ⌘↵; J goes to the 「下一件」 it names.
+		const nextText = (await r.locator('.nx').innerText()).replace(/^下一件：/, '');
+		await page.keyboard.press('Meta+Enter');
+		await expect(r.locator('.card h2')).toHaveText('✓ 已停止 w-export');
+		await page.keyboard.press('KeyJ');
+		await expect(r.locator('.ask h2')).toHaveText(nextText);
+		await page.clock.runFor(10_000);
+		await expect(page.locator('[data-undo]')).toHaveCount(0);
+		// Demo answers come from demoTransport: no c9p request of these reached Tauri.
+		for (const m of MUTATING) expect(await calls(page, m), m).toEqual([]);
+	});
+
+	test('G5 live: msg.send to a managed agent only after 10 s; undo sends nothing', async ({ page }) => {
+		await live(page, false, true);
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		const item = page.locator('.queue .qi', { hasText: 'rate limiter' });
+		await item.click();
+		const p = panel(page);
+		await expect(p.locator('[data-cannot]')).toHaveCount(0);
+		await expect(p.locator('.note')).not.toContainText('示範');
+		await p.locator('textarea').fill('Use Redis.');
+		await page.keyboard.press('Meta+Enter');
+		await expect(page.locator('[data-undo]')).toContainText('10 秒後送出');
+		await page.clock.runFor(9_000);
+		expect(await calls(page, 'msg.send')).toEqual([]);
+		await page.locator('[data-undo] button').click();
+		await page.clock.runFor(10_000);
+		expect(await calls(page, 'msg.send')).toEqual([]);
+		// The draft came back with the item.
+		await expect(p.locator('textarea')).toHaveValue('Use Redis.');
+		await page.keyboard.press('Meta+Enter');
+		await page.clock.runFor(10_000);
+		await expect.poll(() => calls(page, 'msg.send')).toEqual([{ to: MANAGED.id, body: 'Use Redis.' }]);
+		await expect(page.locator('[data-done]')).toContainText('送出了');
+		const text = await page.locator('.glass-root').innerText();
+		for (const t of FIXTURE_TEXT) expect(text, `fixture text "${t}" in live mode`).not.toContain(t);
+	});
+
+	test('G5 live: leaving the page before 10 s sends nothing; the draft stays', async ({ page }) => {
+		await live(page, false, true);
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		await page.locator('.queue .qi', { hasText: 'rate limiter' }).click();
+		await panel(page).locator('textarea').fill('Use memory.');
+		await page.keyboard.press('Meta+Enter');
+		await expect(page.locator('[data-leave-rule]')).toBeVisible();
+		await page.locator('.glass-side a', { hasText: '今天' }).click();
+		await expect(page.locator('.glass-root')).toHaveAttribute('data-page', 'today');
+		await page.clock.runFor(30_000);
+		expect(await calls(page, 'msg.send')).toEqual([]);
+		await page.locator('.glass-side [data-nav="needs"]').click();
+		await page.locator('.queue .qi', { hasText: 'rate limiter' }).click();
+		await expect(panel(page).locator('textarea')).toHaveValue('Use memory.');
+	});
+
+	test('G5 live: closing (hiding) the window cancels every waiting send; the item comes back with its draft', async ({ page }) => {
+		await live(page, false, true);
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		const item = page.locator('.queue .qi', { hasText: 'rate limiter' });
+		await item.click();
+		await panel(page).locator('textarea').fill('Use Redis.');
+		await page.keyboard.press('Meta+Enter');
+		await expect(page.locator('[data-undo]')).toBeVisible();
+		await expect(item).toHaveCount(0);
+		// The Tauri close button: lib.rs only hides the window.
+		await page.evaluate(() => (window as any).__TAURI_INTERNALS__.invoke('plugin:event|emit', { event: 'tauri://close-requested', payload: null }));
+		await expect(page.locator('[data-undo]')).toHaveCount(0);
+		await expect(page.locator('[data-notice]')).toContainText('視窗關掉或縮小了');
+		await page.clock.runFor(30_000);
+		expect(await calls(page, 'msg.send')).toEqual([]);
+		await item.click();
+		await expect(panel(page).locator('textarea')).toHaveValue('Use Redis.');
+		// The same for a hidden page (minimize, or a webview that hides).
+		await page.keyboard.press('Meta+Enter');
+		await expect(page.locator('[data-undo]')).toBeVisible();
+		await page.evaluate(() => {
+			Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+			document.dispatchEvent(new Event('visibilitychange'));
+		});
+		await page.clock.runFor(30_000);
+		expect(await calls(page, 'msg.send')).toEqual([]);
+		await expect(item).toHaveCount(1);
+	});
+
+	test('G5 live: switching items during a stop keeps the lock; session.stop runs once', async ({ page }) => {
+		await live(page, false, true, true);
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		const item = page.locator('.queue .qi', { hasText: 'rate limiter' });
+		await item.click();
+		await panel(page).locator('[data-stop]').click();
+		await panel(page).locator('[data-stop-confirm]').click();
+		await expect(panel(page).locator('[data-stop-confirm]')).toHaveText('停止中…');
+		await page.locator('.queue .qi', { hasText: '允許' }).click();
+		await item.click();
+		await expect(panel(page).locator('[data-stop]')).toBeDisabled();
+		await expect(panel(page).locator('[data-stop]')).toHaveText('停止中…');
+		await panel(page).locator('[data-stop]').click({ force: true });
+		await expect(panel(page).locator('[data-stop-confirm]')).toHaveCount(0);
+		await page.evaluate(() => (window as any).__C9_RELEASE_STOP__());
+		await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+		expect((await calls(page, 'session.stop')).length).toBe(1);
+	});
+
+	test('G5 live: stop a managed agent (session.stop, receipt); an observed session gets ⌘O only', async ({ page }) => {
+		await live(page, false, true);
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		await page.locator('.queue .qi', { hasText: '允許' }).click();
+		await expect(panel(page).locator('[data-stop]')).toHaveCount(0);
+		await expect(panel(page).locator('textarea')).toHaveCount(0);
+		await expect(panel(page).locator('[data-cannot]')).toHaveText('c9watch 還不能直接回答');
+		await page.locator('.queue .qi', { hasText: 'rate limiter' }).click();
+		await panel(page).locator('[data-stop]').click();
+		await panel(page).locator('[data-stop-confirm]').click();
+		await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+		await expect(panel(page).locator('.kv')).toContainText('pid 41003');
+		await expect(panel(page).locator('.kv')).not.toContainText('示範');
+		await expect.poll(() => calls(page, 'session.stop')).toEqual([{ sessionKey: MANAGED.sessionKey, pid: 41003 }]);
+		expect(await calls(page, 'msg.send')).toEqual([]);
 	});
 });

@@ -5,7 +5,9 @@
     // with source and confidence, options, the 「以後直接做」 toggle (允許
     // only, D9 = C) and a receipt. The page owns the keys (keys.ts) and calls
     // `option`, `submit` and `openChat`. A send button without a handler is
-    // off and says so (G4 is read-only; sending is G5).
+    // off and says so. G5: the page passes `onSubmit` / `onNo` (a delayed
+    // `msg.send` to a managed agent) and `onStop` (`session.stop`, which
+    // ends in a receipt and cannot be undone).
     import { tick } from 'svelte';
     import OfflineBanner from './OfflineBanner.svelte';
     import { CANNOT_ANSWER, PREVIEW_ONLY, fieldStep, primaryState, showsFree, showsReject, waitText, type Answer, type HandlingDetail } from './detail';
@@ -36,10 +38,21 @@
      * item only came up because the page opened: a field that takes the
      * focus on load would eat the shell keys ([, ⌘N, ⌘K). */
     export let autofocus = true;
+    /** Stops the agent (`session.stop`). The panel asks once more first. */
+    export let onStop: (() => Promise<void>) | undefined = undefined;
+    /** ⌘Z in the empty key field (same rule as J / K, handoff test #7). */
+    export let onUndo: (() => void) | undefined = undefined;
+    /** Demo: says that nothing is really sent or stopped. */
+    export let demo = false;
 
     let notice: string | null = null;
     let lastId = '';
-    $: if (detail.id !== lastId) { lastId = detail.id; notice = null; }
+    $: if (detail.id !== lastId) { lastId = detail.id; notice = null; confirmStop = false; }
+    let confirmStop = false;
+    /** A `session.stop` for this item's session is in flight. The page keeps
+     * the lock per session (handling/handled.ts), so it outlives this panel
+     * and a switch to another item. */
+    export let stopBusy = false;
 
     // Offline wording only when a handler could keep the answer for later.
     $: ps = primaryState(detail, answer, offline !== null && !!onSubmit);
@@ -69,14 +82,23 @@
     }
     /** ⌘↵: the main button. */
     export function submit() {
-        if (receipt) return;
+        if (receipt || confirmStop || stopBusy) return;
         if (ps.chat) { openChat(); return; }
         if (ps.off) return;
         if (onSubmit) onSubmit(answer);
     }
     function no() {
-        onNo?.();
+        if (!offline) onNo?.();
     }
+    async function stop() {
+        if (!onStop || stopBusy) return;
+        notice = null;
+        try { await onStop(); confirmStop = false; }
+        catch (e) { notice = `沒有停止：${(e as { msg?: string; message?: string })?.msg ?? (e as { message?: string })?.message ?? String(e)}`; }
+    }
+    $: sendNote = detail.canAnswer && onSubmit && !detail.sendBlock
+        ? `送出後跳到下一件。10 秒後才真的送出，在那之前可以按「復原」（⌘Z）。`
+        : '';
 
     /** Puts the cursor in the key field (給, R7-SPEC §A.3). */
     function focusField(el: HTMLInputElement, on: boolean) {
@@ -86,8 +108,8 @@
     /** Handoff test #7: while the key field is empty, J / K still change item. */
     function fieldKeys(e: KeyboardEvent) {
         const step = fieldStep(e, answer.input);
-        const fn = step === 1 ? onNext : step === -1 ? onPrev : undefined;
-        if (fn) { e.preventDefault(); fn(); }
+        const fn = step === 1 ? onNext : step === -1 ? onPrev : step === 'undo' ? onUndo : undefined;
+        if (fn) { e.preventDefault(); e.stopPropagation(); fn(); }
     }
 </script>
 
@@ -196,10 +218,20 @@
 
         <div class="acts">
             {#if !detail.canAnswer}<p class="cannot" data-cannot>{CANNOT_ANSWER}</p>{/if}
-            <span class="note">{detail.note}{detail.canAnswer && detail.reversible && onSubmit ? `${detail.note ? ' ' : ''}送出後跳到下一件，10 秒內可以按「復原」。` : ''}</span>
+            <span class="note">{[detail.note, sendNote, demo && (onSubmit || onStop) ? '示範模式：不會真的送出或停止。' : ''].filter(Boolean).join(' ')}</span>
             {#if notice}<span class="notice" role="status">{notice}</span>{/if}
+            {#if confirmStop}
+                <div class="confirm" role="group" aria-label="確認停止" data-confirm-stop>
+                    <span>停止 {detail.who}？這會結束它的程式，不能復原。</span>
+                    <div class="row">
+                        <button type="button" class="btn" disabled={stopBusy} on:click={() => (confirmStop = false)}>取消</button>
+                        <button type="button" class="btn danger" disabled={stopBusy} on:click={stop} data-stop-confirm>{stopBusy ? '停止中…' : '停止（不能復原）'}</button>
+                    </div>
+                </div>
+            {/if}
             <div class="row">
-                {#if detail.no}<button type="button" class="btn" disabled={!onNo} on:click={no}>{detail.no}</button>{/if}
+                {#if onStop}<button type="button" class="btn" disabled={confirmStop || stopBusy || !!offline} on:click={() => (confirmStop = true)} data-stop>{stopBusy ? '停止中…' : '停止這個 agent…'}</button>{/if}
+                {#if detail.no}<button type="button" class="btn" disabled={!onNo || !!offline} on:click={no}>{detail.no}</button>{/if}
                 {#if detail.canAnswer}<button type="button" class="btn" disabled={!onOpenChat} on:click={openChat}>開啟對談<kbd>⌘O</kbd></button>{/if}
                 <button type="button" class="btn primary" disabled={primaryOff} on:click={submit} data-primary data-preview={preview || undefined}>
                     <span>{primaryText}</span><kbd>{ps.chat ? '⌘O' : '⌘↵'}</kbd>
@@ -309,6 +341,12 @@
     .btn.primary { margin-left: auto; border-color: var(--text-1); background: var(--text-1); color: var(--surface-window-solid); font-weight: 600; }
     .btn.primary kbd { color: #555; }
     .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn.danger { border-color: rgb(255 92 92 / 0.6); color: var(--text-1); }
+    .confirm {
+        display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3) 14px;
+        border: 1px solid rgb(255 92 92 / 0.35); border-radius: var(--radius-md); background: rgb(255 92 92 / 0.06);
+        font-size: 14px; color: var(--text-1);
+    }
     .help { margin: 0; padding-top: var(--space-3); border-top: 1px solid var(--divider); font-size: 12px; color: var(--text-3); }
     @media (max-width: 760px) { .shots { grid-template-columns: 1fr; } }
     @media (prefers-reduced-motion: reduce) { .sw input::after { transition: none; } }
