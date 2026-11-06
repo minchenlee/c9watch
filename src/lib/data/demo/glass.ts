@@ -5,7 +5,7 @@
  * the 5 items that need you. Data c9p does not have (goals, needs verbs, seat
  * caps, rules) lives in `src/shells/glass/model/gaps-demo.ts`.
  * Times are relative to `Date.now()`, so a fixed test clock gives fixed rows. */
-import type { C9pAgentRow, C9pAnnotation, C9pAnnotationValue, C9pSessionView, C9pWaitingFor } from '../../c9p-1';
+import type { C9pAgentRow, C9pAnnotation, C9pAnnotationValue, C9pCostData, C9pHistoryEntry, C9pProjectMemory, C9pSessionCostRecord, C9pSessionView, C9pWaitingFor } from '../../c9p-1';
 
 /** Workspace roots. `cross` is the parent folder: its goal spans repos. */
 export const GLASS_DEMO_ROOTS = {
@@ -105,5 +105,73 @@ export function glassDemoAnnotations(): C9pAnnotation[] {
         note('w-monitor', 'ci/tests', '測試', { type: 'string', v: '12/12' }, 4),
         note('w-export', 'ci/retries', '重試', { type: 'number', v: 2 }, 7),
         note('w-tests', 'ci/job', 'cargo test', { type: 'duration', ms: 95_000 }, 1)
+    ];
+}
+
+/** Past sessions per workspace (workspace page 「已完成」). Content follows
+ * `design-r7/canvas/Workspace.dc.html`. Newest first. */
+const DONE: { ws: GlassDemoWorkspace; days: number; title: string; display: string; provider: 'claudeCode' | 'codex' }[] = [
+    { ws: 'c9watch', days: 0, title: 'MONITOR 畫面換新詞', display: 'verifier 通過 · 2 個 worker', provider: 'claudeCode' },
+    { ws: 'c9watch', days: 0, title: 'authz 介面', display: 'verifier 通過', provider: 'claudeCode' },
+    { ws: 'c9watch', days: 2, title: 'policy 載入', display: '3 個檔案', provider: 'codex' },
+    { ws: 'flockbook', days: 0, title: '匯出 CSV › 欄位對應', display: '匯出的欄位和畫面上的表格一致。', provider: 'claudeCode' },
+    { ws: 'flockbook', days: 1, title: '對談 · feed 快取修正', display: '3 個檔案 · 你和 claude 一起做', provider: 'claudeCode' },
+    { ws: 'flockbook', days: 5, title: '登入頁改版', display: '2 個 worker · verifier 通過', provider: 'claudeCode' },
+    { ws: 'flockbook', days: 8, title: '圖片上傳壓縮', display: '上傳時間少一半', provider: 'codex' },
+    { ws: 'jumpmark', days: 3, title: '書籤匯入', display: '支援 Chrome 和 Safari 的匯出檔', provider: 'claudeCode' },
+    { ws: 'cross', days: 0, title: '搜尋改版 › 索引重建', display: '搜尋從 1.2 秒降到 180 毫秒', provider: 'claudeCode' },
+    { ws: 'cross', days: 0, title: '搜尋改版 › 結果頁', display: '搜尋結果頁改版', provider: 'codex' }
+];
+const dayAgo = (days: number) => Date.now() - days * 24 * 60 * 60_000 - 30 * 60_000;
+const name = (ws: GlassDemoWorkspace) => GLASS_DEMO_ROOTS[ws].split('/').pop()!;
+export function glassDemoHistory(): C9pHistoryEntry[] {
+    return DONE.map((d, i): C9pHistoryEntry => ({
+        customTitle: d.title, display: d.display, project: GLASS_DEMO_ROOTS[d.ws], projectName: name(d.ws),
+        provider: d.provider, sessionId: `glass-done-${i}`, timestamp: dayAgo(d.days)
+    }));
+}
+
+/** Tokens per workspace, today and earlier this month. */
+const SPEND: { ws: GlassDemoWorkspace; days: number; model: string; provider: string; tokens: number; cost: number }[] = [
+    { ws: 'c9watch', days: 0, model: 'claude-opus-4-1', provider: 'claude', tokens: 1_200_000, cost: 14.2 },
+    { ws: 'c9watch', days: 0, model: 'gpt-5-codex', provider: 'codex', tokens: 300_000, cost: 1.9 },
+    { ws: 'c9watch', days: 3, model: 'claude-opus-4-1', provider: 'claude', tokens: 9_500_000, cost: 98.4 },
+    { ws: 'flockbook', days: 0, model: 'claude-sonnet-4-5', provider: 'claude', tokens: 400_000, cost: 2.1 },
+    { ws: 'flockbook', days: 4, model: 'claude-sonnet-4-5', provider: 'claude', tokens: 7_000_000, cost: 31.5 },
+    { ws: 'jumpmark', days: 0, model: 'claude-sonnet-4-5', provider: 'claude', tokens: 200_000, cost: 0.9 },
+    { ws: 'jumpmark', days: 2, model: 'gpt-5-codex', provider: 'codex', tokens: 1_800_000, cost: 7.4 },
+    { ws: 'cross', days: 0, model: 'claude-opus-4-1', provider: 'claude', tokens: 600_000, cost: 6.8 },
+    { ws: 'cross', days: 1, model: 'gpt-5-codex', provider: 'codex', tokens: 2_100_000, cost: 8.2 }
+];
+const localDay = (t: number) => { const d = new Date(t); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+export function glassDemoCost(): C9pCostData {
+    const records = SPEND.map((r, i): C9pSessionCostRecord => ({
+        cachedInputTokens: Math.round(r.tokens * 0.5), cost: r.cost, costAvailable: true, date: localDay(dayAgo(r.days)),
+        inputTokens: Math.round(r.tokens * 0.3), model: r.model, outputTokens: r.tokens - Math.round(r.tokens * 0.5) - Math.round(r.tokens * 0.3),
+        project: GLASS_DEMO_ROOTS[r.ws], projectName: name(r.ws), provider: r.provider, reasoningOutputTokens: 0,
+        sessionId: `glass-spend-${i}`, sessionName: name(r.ws), timestamp: new Date(dayAgo(r.days)).toISOString(), totalTokens: r.tokens
+    }));
+    const sum = (rs: C9pSessionCostRecord[]) => rs.reduce((a, r) => a + r.cost, 0);
+    const toks = (rs: C9pSessionCostRecord[]) => rs.reduce((a, r) => a + r.inputTokens + r.outputTokens + r.cachedInputTokens + r.reasoningOutputTokens, 0);
+    const group = <K>(key: (r: C9pSessionCostRecord) => K) => { const m = new Map<K, C9pSessionCostRecord[]>(); for (const r of records) m.set(key(r), [...(m.get(key(r)) ?? []), r]); return m; };
+    const total = sum(records);
+    return {
+        dailyCosts: [...group(r => r.date)].map(([date, rs]) => ({ date, cost: sum(rs), sessions: rs })),
+        modelCosts: [...group(r => r.model)].map(([model, rs]) => ({ model, displayName: model, provider: rs[0].provider, cost: sum(rs), costAvailable: true, totalTokens: toks(rs), percentage: total ? (sum(rs) / total) * 100 : 0 })),
+        projectCosts: [...group(r => r.project)].map(([project, rs]) => ({ project, projectName: rs[0].projectName, sessions: rs, totalCost: sum(rs) })),
+        totalCost: total, totalTokens: toks(records), unpricedTokens: 0
+    };
+}
+
+/** Memory and instructions per workspace (workspace page 「記憶與指示」). */
+export function glassDemoMemory(): C9pProjectMemory[] {
+    const file = (ws: GlassDemoWorkspace, lines: string[]): C9pProjectMemory => ({
+        files: [{ filename: 'MEMORY.md', content: lines.join('\n') }], memoryDirPath: `/Users/demo/.claude/projects/${name(ws)}/memory`,
+        projectName: name(ws), projectPath: GLASS_DEMO_ROOTS[ws], provider: 'claudeCode'
+    });
+    return [
+        file('c9watch', ['# c9watch', '- Classic 介面凍結，新畫面只放在 glass。', '- 狀態用詞以詞表為準。']),
+        file('flockbook', ['# flockbook', '- 用 pnpm，不要用 npm。', '- 匯出相關的測試用 staging 資料。']),
+        file('jumpmark', ['# jumpmark', '- 登入測試要 staging 的 API key。'])
     ];
 }

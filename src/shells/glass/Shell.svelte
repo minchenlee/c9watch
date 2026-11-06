@@ -11,6 +11,7 @@
     import { installKeys } from './keys';
     import { glassMode, sidebarCollapsed } from './prefs';
     import Sidebar from './Sidebar.svelte';
+    import Workspace from './pages/Workspace.svelte';
     import Needs from './pages/Needs.svelte';
 
     // startGlassData returns its stop function, which Svelte runs on unmount.
@@ -72,8 +73,12 @@
         <div class="glass-page full"><Needs /></div>
     {:else}
         <main class="glass-page" aria-label={info.title}>
-            <header><h1>{info.title}</h1></header>
-            <p class="state-msg">{info.empty}</p>
+            {#if $route.page === 'ws'}
+                <Workspace id={$route.id} title={info.title} />
+            {:else}
+                <header><h1>{info.title}</h1></header>
+                <p class="state-msg">{info.empty}</p>
+            {/if}
         </main>
     {/if}
     {#if hint}

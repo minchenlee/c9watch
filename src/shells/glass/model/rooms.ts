@@ -62,15 +62,22 @@ function agentStatus(a: C9pAgentRow): MemberStatus {
 const ms = (iso: string | undefined) => { const t = iso ? Date.parse(iso) : NaN; return Number.isFinite(t) ? t : 0; };
 const base = (p: string) => p.split('/').filter(Boolean).pop() ?? p;
 
+/** A session's key. c9p always sends `sessionKey`; a row without one (an old
+ * transport, a test fixture) falls back to `<provider>:<id>`, so two such
+ * sessions never share a member or a row. */
+export function sessionKeyOf(s: Pick<C9pSessionView, 'sessionKey' | 'provider' | 'id'>): string {
+    return s.sessionKey || `${s.provider}:${s.id}`;
+}
+
 /** One member per agent row (joined to its session by `sessionKey`), plus one
  * talk member per session no agent claims (an observed session). */
 export function buildMembers(sessions: C9pSessionView[], agents: C9pAgentRow[]): Member[] {
-    const bySession = new Map(sessions.map(s => [s.sessionKey, s]));
+    const bySession = new Map(sessions.map(s => [sessionKeyOf(s), s]));
     const parents = new Set(agents.map(a => a.parentId).filter(Boolean));
     const claimed = new Set<string>();
     const out: Member[] = agents.map(a => {
         const s = a.sessionKey ? bySession.get(a.sessionKey) ?? null : null;
-        if (s) claimed.add(s.sessionKey);
+        if (s) claimed.add(sessionKeyOf(s));
         const done = agentStatus(a) === 'done';
         const role: Role = a.role === 'human' ? 'human' : a.role === 'orch' || parents.has(a.id) ? 'lead' : a.parentId ? 'worker' : 'talk';
         const path = a.cwd ?? s?.projectPath ?? '';
@@ -82,9 +89,10 @@ export function buildMembers(sessions: C9pSessionView[], agents: C9pAgentRow[]):
         };
     });
     for (const s of sessions) {
-        if (claimed.has(s.sessionKey)) continue;
+        const key = sessionKeyOf(s);
+        if (claimed.has(key)) continue;
         out.push({
-            key: s.sessionKey, agentId: null, sessionKey: s.sessionKey, role: 'talk', parentId: null, path: s.projectPath,
+            key, agentId: null, sessionKey: key, role: 'talk', parentId: null, path: s.projectPath,
             name: s.customTitle ?? s.sessionName ?? base(s.projectPath), status: sessionStatus(s.status), live: true,
             mailPaused: false, seenAt: ms(s.modified), agent: null, session: s
         });

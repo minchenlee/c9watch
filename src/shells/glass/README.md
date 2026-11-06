@@ -46,6 +46,16 @@ G1 frame:
   extension slot (empty) → 用量 / 設定. `[` collapses it to a
   「需要你 · N」 button. ⌘N shows a `c9watch spawn` hint (no delegate in v1).
 
+G3 workspace page (`#/ws/<id>`, `pages/Workspace.svelte`):
+
+- Data: the `model` store only (workspace → rows → members) plus one read
+  each of `history.list`, `cost.get` and `memory.list`, filtered by repo root
+  (`pages/workspace-extras.ts`). Demo rules show only while the fixture is on.
+- `ui/`: the classic card (`SessionCard`), `PixelStatus`, `PixelBar` and
+  `AnnotationChips` (direction §10, core plan §8.2). Pure helpers in
+  `ui/format.ts`; `scripts/test-glass-ui.mjs` covers them.
+- Orange only for a needs-queue item. Cards have no approve / reject (G5).
+
 G4 需要你 page (read-only):
 
 - `pages/Needs.svelte`: the queue (280px, `$model.needs`, longest wait first
