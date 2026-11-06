@@ -5,7 +5,7 @@
  * the 5 items that need you. Data c9p does not have (goals, needs verbs, seat
  * caps, rules) lives in `src/shells/glass/model/gaps-demo.ts`.
  * Times are relative to `Date.now()`, so a fixed test clock gives fixed rows. */
-import type { C9pAgentRow, C9pAnnotation, C9pAnnotationValue, C9pCostData, C9pHistoryEntry, C9pProjectMemory, C9pSessionCostRecord, C9pSessionView, C9pWaitingFor } from '../../c9p-1';
+import type { C9pAgentRow, C9pAnnotation, C9pAwayActivity, C9pAnnotationValue, C9pCostData, C9pHistoryEntry, C9pProjectMemory, C9pSessionCostRecord, C9pSessionView, C9pWaitingFor } from '../../c9p-1';
 
 /** Workspace roots. `cross` is the parent folder: its goal spans repos. */
 export const GLASS_DEMO_ROOTS = {
@@ -28,7 +28,7 @@ const SEATS: Seat[] = [
     { slug: 'lead-terms', name: 'lead-terms', ws: 'c9watch', role: 'orch', provider: 'claudeCode', seat: 'idle', act: '分派 3 個 worker，等 w-monitor 交件', ago: 3 },
     { slug: 'w-monitor', name: 'w-monitor', ws: 'c9watch', role: 'worker', parent: 'lead-terms', provider: 'codex', seat: 'need', act: '交付：改前改後截圖 2 張 · 測試 12/12', ago: 4, branch: 'feature/status-terms-monitor' },
     { slug: 'w-agents', name: 'w-agents', ws: 'c9watch', role: 'worker', parent: 'lead-terms', provider: 'claudeCode', seat: 'need', act: '要不要改狀態色？停在 src/agents/StatusChip.svelte', ago: 6, wait: { kind: 'question' }, tool: { name: 'AskUserQuestion', input: { question: '要不要改狀態色？' } } },
-    { slug: 'w-history', name: 'w-history', ws: 'c9watch', role: 'worker', parent: 'lead-terms', provider: 'claudeCode', seat: 'quiet', act: '讀 src/history/list.svelte', ago: 14 },
+    { slug: 'w-history', name: 'w-history', ws: 'c9watch', role: 'worker', parent: 'lead-terms', provider: 'claudeCode', seat: 'quiet', act: '讀 src/history/list.svelte', ago: 24 },
     // C9WATCH · goal 引擎權限重構
     { slug: 'lead-authz', name: 'lead-authz', ws: 'c9watch', role: 'orch', provider: 'claudeCode', seat: 'work', act: '協調 5 個 worker', ago: 1 },
     { slug: 'w-authz', name: 'w-authz', ws: 'c9watch', role: 'worker', parent: 'lead-authz', provider: 'claudeCode', seat: 'work', act: '改 engine/authz.rs', ago: 1 },
@@ -131,8 +131,10 @@ export function glassDemoHistory(): C9pHistoryEntry[] {
     }));
 }
 
-/** Tokens per workspace, today and earlier this month. */
-const SPEND: { ws: GlassDemoWorkspace; days: number; model: string; provider: string; tokens: number; cost: number }[] = [
+/** Tokens per workspace: today, earlier this month and up to 40 days back
+ * (用量 page periods). `priced: false` is a model with no local price table
+ * (Cursor): it has tokens and no USD estimate. */
+const SPEND: { ws: GlassDemoWorkspace; days: number; model: string; provider: string; tokens: number; cost: number; priced?: false }[] = [
     { ws: 'c9watch', days: 0, model: 'claude-opus-4-1', provider: 'claude', tokens: 1_200_000, cost: 14.2 },
     { ws: 'c9watch', days: 0, model: 'gpt-5-codex', provider: 'codex', tokens: 300_000, cost: 1.9 },
     { ws: 'c9watch', days: 3, model: 'claude-opus-4-1', provider: 'claude', tokens: 9_500_000, cost: 98.4 },
@@ -141,25 +143,32 @@ const SPEND: { ws: GlassDemoWorkspace; days: number; model: string; provider: st
     { ws: 'jumpmark', days: 0, model: 'claude-sonnet-4-5', provider: 'claude', tokens: 200_000, cost: 0.9 },
     { ws: 'jumpmark', days: 2, model: 'gpt-5-codex', provider: 'codex', tokens: 1_800_000, cost: 7.4 },
     { ws: 'cross', days: 0, model: 'claude-opus-4-1', provider: 'claude', tokens: 600_000, cost: 6.8 },
-    { ws: 'cross', days: 1, model: 'gpt-5-codex', provider: 'codex', tokens: 2_100_000, cost: 8.2 }
+    { ws: 'cross', days: 1, model: 'gpt-5-codex', provider: 'codex', tokens: 2_100_000, cost: 8.2 },
+    { ws: 'jumpmark', days: 1, model: 'cursor-auto', provider: 'cursor', tokens: 900_000, cost: 0, priced: false },
+    { ws: 'c9watch', days: 5, model: 'claude-opus-4-1', provider: 'claude', tokens: 4_200_000, cost: 44.6 },
+    { ws: 'flockbook', days: 12, model: 'claude-sonnet-4-5', provider: 'claude', tokens: 3_300_000, cost: 14.9 },
+    { ws: 'c9watch', days: 20, model: 'claude-opus-4-1', provider: 'claude', tokens: 6_000_000, cost: 61.2 },
+    { ws: 'jumpmark', days: 27, model: 'gpt-5-codex', provider: 'codex', tokens: 2_500_000, cost: 9.8 },
+    { ws: 'c9watch', days: 35, model: 'claude-opus-4-1', provider: 'claude', tokens: 5_100_000, cost: 52.3 },
+    { ws: 'flockbook', days: 40, model: 'claude-sonnet-4-5', provider: 'claude', tokens: 2_800_000, cost: 12.6 }
 ];
 const localDay = (t: number) => { const d = new Date(t); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 export function glassDemoCost(): C9pCostData {
     const records = SPEND.map((r, i): C9pSessionCostRecord => ({
-        cachedInputTokens: Math.round(r.tokens * 0.5), cost: r.cost, costAvailable: true, date: localDay(dayAgo(r.days)),
+        cachedInputTokens: Math.round(r.tokens * 0.5), cost: r.cost, costAvailable: r.priced !== false, date: localDay(dayAgo(r.days)),
         inputTokens: Math.round(r.tokens * 0.3), model: r.model, outputTokens: r.tokens - Math.round(r.tokens * 0.5) - Math.round(r.tokens * 0.3),
         project: GLASS_DEMO_ROOTS[r.ws], projectName: name(r.ws), provider: r.provider, reasoningOutputTokens: 0,
         sessionId: `glass-spend-${i}`, sessionName: name(r.ws), timestamp: new Date(dayAgo(r.days)).toISOString(), totalTokens: r.tokens
     }));
-    const sum = (rs: C9pSessionCostRecord[]) => rs.reduce((a, r) => a + r.cost, 0);
+    const sum = (rs: C9pSessionCostRecord[]) => rs.reduce((a, r) => a + (r.costAvailable ? r.cost : 0), 0);
     const toks = (rs: C9pSessionCostRecord[]) => rs.reduce((a, r) => a + r.inputTokens + r.outputTokens + r.cachedInputTokens + r.reasoningOutputTokens, 0);
     const group = <K>(key: (r: C9pSessionCostRecord) => K) => { const m = new Map<K, C9pSessionCostRecord[]>(); for (const r of records) m.set(key(r), [...(m.get(key(r)) ?? []), r]); return m; };
     const total = sum(records);
     return {
         dailyCosts: [...group(r => r.date)].map(([date, rs]) => ({ date, cost: sum(rs), sessions: rs })),
-        modelCosts: [...group(r => r.model)].map(([model, rs]) => ({ model, displayName: model, provider: rs[0].provider, cost: sum(rs), costAvailable: true, totalTokens: toks(rs), percentage: total ? (sum(rs) / total) * 100 : 0 })),
+        modelCosts: [...group(r => r.model)].map(([model, rs]) => ({ model, displayName: model, provider: rs[0].provider, cost: sum(rs), costAvailable: rs.every(r => r.costAvailable), totalTokens: toks(rs), percentage: total ? (sum(rs) / total) * 100 : 0 })),
         projectCosts: [...group(r => r.project)].map(([project, rs]) => ({ project, projectName: rs[0].projectName, sessions: rs, totalCost: sum(rs) })),
-        totalCost: total, totalTokens: toks(records), unpricedTokens: 0
+        totalCost: total, totalTokens: toks(records), unpricedTokens: toks(records.filter(r => !r.costAvailable))
     };
 }
 
@@ -174,4 +183,17 @@ export function glassDemoMemory(): C9pProjectMemory[] {
         file('flockbook', ['# flockbook', '- 用 pnpm，不要用 npm。', '- 匯出相關的測試用 staging 資料。']),
         file('jumpmark', ['# jumpmark', '- 登入測試要 staging 的 API key。'])
     ];
+}
+
+/** `session.away` for the fixture: what each live session did since
+ * `sinceMs` (今天 page 「還在進行」). Working seats did more; idle ones less. */
+export function glassDemoAway(requests: { sessionKey: string; sinceMs: number }[] = []): Record<string, C9pAwayActivity> {
+    const out: Record<string, C9pAwayActivity> = {};
+    for (const { sessionKey, sinceMs } of requests) {
+        const i = LIVE.findIndex(s => keyOf(s) === sessionKey);
+        if (i < 0) continue;
+        const busy = LIVE[i].seat === 'work' ? 3 : 1;
+        out[sessionKey] = { commandsRun: busy * (2 + (i % 4)), filesEdited: busy * (1 + (i % 3)), partial: false, sinceMs, subagentsCompleted: i % 2, toolCalls: busy * (6 + i) };
+    }
+    return out;
 }

@@ -141,3 +141,41 @@ G6 extension host (`ext/`, glass build plan §3, manifest per owner D41 R1–R12
   ⌘K, ⌘N and Esc; it sends unused keys back with `host.keys.forward`.
 - `extensions/hello/` is `dev: true`: dev builds only. Tests:
   `npx playwright test -c tests/glass/playwright.config.ts` (vite dev, port 4181).
+
+G10a 今天 / 用量 / 設定 (host pages, `pages/`):
+
+- `Today.svelte` + `today-model.ts` (pure): 需要你 is one line
+  「查看 N 件需要你 →」 (a link only). Then 驗收完 → 被退回 → 需要留意
+  (沒回應 = G2 stale) → 還在進行 (rows with a working member, with
+  `session.away` counts since local midnight). A history row whose
+  `provider:sessionId` is a live member's session key is not in 今天完成.
+  Live mode has no verifier
+  (Gap V): the first section is 「今天完成」 (`history.list` since
+  midnight) and 被退回 is hidden. 「依你的規則自動做了」 is hidden (Gap R).
+  Reviews come from `DEMO_TODAY` in the gaps file, fixture only.
+- `Usage.svelte` + `usage-math.ts` (pure): periods 今天 / 7 天 / 30 天 /
+  本月 / 上個月 (UTC calendar days, the same days as core's cost buckets). Cards: 實付 (the monthly fee pref
+  `glass.monthlyFee`, spread per day of each month), 照 API 價估算 (priced
+  records only; no price is 「沒有價格」, never $0), 用量 (tokens), agent
+  工作時數 (core has no work time: live mode says so; the fixture uses
+  `DEMO_AGENT_HOURS`). Daily token bars in one gray. Rows by workspace and
+  主要模型 (「依 session 主要模型」: core gives one main model per session
+  per day): token, 分攤（實付, token share）, ≈ API 價. Quota from
+  `usage.subscriptions`; a plan without windows, an empty list or a failed
+  read shows the reason. ≥ 90% is orange. A snapshot older than 10 minutes
+  says how old it is; a window whose reset time has passed says so and is
+  never orange.
+- `refresh.ts` (`startRefresh`): 今天 and 用量 read again every 60 s, on
+  window focus (at most every 15 s) and, on 今天, when the live sessions
+  change. One read at a time; a failed read keeps the last answer and
+  retries on the next tick; unmount stops it.
+- Known limit: core buckets cost by UTC date, so 用量 days are UTC days
+  (the page says 「日期依 UTC 計」), not local days.
+- `Settings.svelte`: Shell (glass → Classic asks first: Classic has no
+  switch back yet), Glass Off / Subtle / Full (`ui.glass`, sets
+  `data-glass`; native vibrancy is G10b), monthly fee, 重新排列房間 (off
+  until the office extension), Extensions (read-only, from `ext/registry`),
+  規則與授權 (shell only; the fixture shows the 允許 rule as
+  「設計預覽，不會儲存」).
+- Tests: `scripts/test-glass-pages.mjs`,
+  `tests/visual/glass-preview/pages.spec.ts`, `tests/glass/pages.spec.ts`.

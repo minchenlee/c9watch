@@ -161,15 +161,16 @@ test('demo transport: glass answers only while the glass shell runs, whatever lo
     urls['../subscription-usage'] = stub('export const demoSubscriptionUsage = () => [];');
     urls['./demo/mail'] = stub('export const demoMailRequest = () => null; export const demoMailSubscribe = () => () => {};');
     urls['./demo/glass'] = stub(`export const glassDemoAgents = () => ['glass']; export const glassDemoAnnotations = () => ['glass']; export const glassDemoSessionViews = () => ['glass'];
-        export const glassDemoHistory = () => ['glass']; export const glassDemoCost = () => ({ glass: 'cost' }); export const glassDemoMemory = () => ['glass'];`);
+        export const glassDemoHistory = () => ['glass']; export const glassDemoCost = () => ({ glass: 'cost' }); export const glassDemoMemory = () => ['glass']; export const glassDemoAway = () => ({ glass: 'away' });`);
     const demo = await load('$lib/data/demo', '../src/lib/data/demo.ts');
     const t = demo.demoTransport;
-    const classic = async () => JSON.stringify(await Promise.all(['session.views', 'history.list', 'cost.get', 'memory.list', 'agent.list', 'annotation.list'].map(m => t.request(m, {}))));
+    const classic = async () => JSON.stringify(await Promise.all(['session.views', 'history.list', 'cost.get', 'memory.list', 'agent.list', 'annotation.list', 'session.away'].map(m => t.request(m, {}))));
     const before = await classic();
     assert(!before.includes('glass'), 'flags persisted, Classic running: no glass answer');
     demo.setDemoGlassActive(true);
     assert.deepEqual((await t.request('history.list', {})).entries, ['glass']);
     assert.deepEqual(await t.request('cost.get', {}), { glass: 'cost' });
+    assert.deepEqual(await t.request('session.away', { requests: [] }), { activity: { glass: 'away' } });
     // D42: the fixture ends the agent itself; agent.retire never needs a core.
     const retired = await t.request('agent.retire', { id: 'agt_demo' });
     assert.equal(retired.agent.id, 'agt_demo');

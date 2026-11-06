@@ -135,3 +135,30 @@ export const DEMO_NEED_DETAILS: DemoNeedDetail[] = [
  * went away 2 minutes ago. The demo transport never fails on its own. */
 export const DEMO_OFFLINE_KEY = 'c9watch.demoGlassOffline';
 export const DEMO_OFFLINE_AGO_MS = 2 * 60_000;
+
+/** 今天 page (redesign §8.13 D2, §8.14; build plan Gap T, V): what the
+ * verifier accepted and sent back today. Core has no verifier, so live mode
+ * shows today's finished sessions from `history.list` instead and hides
+ * 「被退回」. Matches the `verifier` lines of `DEMO_WORKSPACES`. */
+export type DemoReview = { workspace: GlassDemoWorkspace; goal: string; title: string; at: string; note: string };
+export const DEMO_TODAY: { accepted: DemoReview[]; rejected: DemoReview[] } = {
+    accepted: [
+        { workspace: 'c9watch', goal: '狀態用詞統一', title: 'MONITOR 畫面', at: '07:50', note: '測試 12/12 · 截圖比對通過' },
+        { workspace: 'cross', goal: '搜尋改版', title: '索引重建', at: '07:16', note: '搜尋從 1.2 秒降到 180 毫秒' },
+        { workspace: 'cross', goal: '搜尋改版', title: '結果頁', at: '07:16', note: '這個 goal 已經整個完成' },
+        { workspace: 'flockbook', goal: '匯出 CSV', title: '欄位對應', at: '06:58', note: '匯出的欄位和畫面上的表格一致' },
+        { workspace: 'c9watch', goal: '引擎權限重構', title: 'authz 介面', at: '04:31', note: 'verifier 通過' },
+        { workspace: 'c9watch', goal: '引擎權限重構', title: 'policy 載入', at: '04:12', note: 'verifier 通過' }
+    ],
+    rejected: [
+        { workspace: 'c9watch', goal: '狀態用詞統一', title: 'HISTORY 畫面', at: '00:40', note: '還有 2 個舊詞沒換 · w-history 重做中' }
+    ]
+};
+
+/** 用量 page: agent work hours per day (`days` ago). Core does not record
+ * agent work time; live mode says so instead of a number. */
+export const DEMO_AGENT_HOURS: { days: number; hours: number }[] = [
+    { days: 0, hours: 9.5 }, { days: 1, hours: 14 }, { days: 2, hours: 11 }, { days: 3, hours: 16.5 },
+    { days: 4, hours: 12 }, { days: 5, hours: 6 }, { days: 8, hours: 10 }, { days: 12, hours: 8.5 },
+    { days: 20, hours: 13 }, { days: 35, hours: 7 }
+];

@@ -60,7 +60,8 @@ export function historyTitle(e: C9pHistoryEntry): string {
     return e.customTitle || e.aiTitle || e.codexTitle || e.cursorTitle || e.display || e.sessionId;
 }
 
-const tokensOf = (r: C9pSessionCostRecord) => Number.isFinite(r.totalTokens) ? r.totalTokens : r.inputTokens + r.outputTokens + r.cachedInputTokens + r.reasoningOutputTokens;
+/** Tokens of one record; `totalTokens` when the core sent it. */
+export const tokensOf = (r: C9pSessionCostRecord) => Number.isFinite(r.totalTokens) ? r.totalTokens : r.inputTokens + r.outputTokens + r.cachedInputTokens + r.reasoningOutputTokens;
 
 /** How many records behind a total have a USD price (`costAvailable`).
  * `none`: no estimate at all; `some`: the cost is the priced subtotal only. */
