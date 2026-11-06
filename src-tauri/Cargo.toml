@@ -53,6 +53,7 @@ gui = [
     "dep:base64",
     "dep:sha2",
     "dep:tauri-nspanel",
+    "dep:objc2-app-kit",
 ]
 cli = ["c9watch-core/cli", "dep:clap", "dep:regex", "dep:tokio"]
 # Agent engine (C1a): `c9watch engine` and `api`, plus the `c9watch-agent`
@@ -78,7 +79,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 wait-timeout = "0.2"
 
 # ── GUI-only dependencies ────────────────────────────────────────────
-tauri = { version = "2", features = ["tray-icon"], optional = true }
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"], optional = true }
 tauri-plugin-notification = { version = "2", optional = true }
 tauri-plugin-opener = { version = "2", optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
@@ -110,6 +111,9 @@ futures-util = { version = "0.3", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 notify-rust = { version = "4", optional = true }
+# Glass G10b: NSWorkspace.accessibilityDisplayShouldReduceTransparency.
+# Already in the tree through tauri (wry, tao); this names two features.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"], optional = true }
 
 # Smaller dev and test builds: keep line tables for backtraces, drop full
 # debug info.

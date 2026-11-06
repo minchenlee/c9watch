@@ -49,6 +49,7 @@ fn main() {
             "get_debug_logs",
             "get_build_channel",
             "ext_list",
+            "native_glass",
             "opencode_connection_status",
             "opencode_connect",
             "get_notification_preferences",

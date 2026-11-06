@@ -77,7 +77,9 @@ test('data-layer commands have capabilities for each supported window', () => {
     'opencode_connect', 'get_notification_preferences',
     'save_notification_preferences', 'test_native_notification',
     // Glass G7: the extension list is for the main window's glass shell.
-    'ext_list'
+    'ext_list',
+    // Glass G10b: vibrancy and Reduce Transparency, for the same shell.
+    'native_glass'
   ]);
   for (const command of mainOnly) assert.ok(invoked.has(command), `stale main-only command: ${command}`);
   for (const [file, window] of [['default.json', 'main'], ['popover.json', 'popover']]) {

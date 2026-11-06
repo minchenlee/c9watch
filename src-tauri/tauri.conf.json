@@ -10,6 +10,7 @@
     "frontendDist": "../build"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -20,7 +21,10 @@
         "minHeight": 400,
         "visible": true,
         "center": true,
-        "titleBarStyle": "Overlay"
+        "titleBarStyle": "Overlay",
+        "transparent": true,
+        "windowEffects": { "effects": ["sidebar"] },
+        "theme": "Dark"
       },
       {
         "label": "popover",

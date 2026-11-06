@@ -9,7 +9,8 @@
     import type { WorkspaceView } from './model';
     import { DEMO_WORKSPACES } from './model/gaps-demo';
     import { installKeys } from './keys';
-    import { glassMode, sidebarCollapsed } from './prefs';
+    import { sidebarCollapsed } from './prefs';
+    import { effectiveGlass, startNativeGlass } from './native';
     import Sidebar from './Sidebar.svelte';
     import Workspace from './pages/Workspace.svelte';
     import Needs from './pages/Needs.svelte';
@@ -21,6 +22,8 @@
 
     // startGlassData returns its stop function, which Svelte runs on unmount.
     onMount(startGlassData);
+    // Vibrancy and Reduce Transparency from the GUI crate (G10b).
+    onMount(() => startNativeGlass());
 
     // The same list the 需要你 page shows (G2 model; demo verbs only while
     // the fixture is on), less the items handled there (G5).
@@ -62,7 +65,7 @@
 <div
     class="glass-root"
     class:collapsed={$sidebarCollapsed}
-    data-glass={$glassMode}
+    data-glass={$effectiveGlass}
     data-page={pageKey($route)}
     data-sessions={$sessions.length}
     data-agents={$agents.length}

@@ -45,6 +45,7 @@
     "allow-get-debug-logs",
     "allow-get-build-channel",
     "allow-ext-list",
+    "allow-native-glass",
     "allow-opencode-connection-status",
     "allow-opencode-connect",
     "allow-get-notification-preferences",

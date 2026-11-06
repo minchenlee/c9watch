@@ -39,6 +39,13 @@ G1 frame:
 - `tokens.css`: every glass token, scoped to `.glass-root`. `data-glass` =
   `off` / `subtle` / `full` (from `localStorage['ui.glass']`, `prefs.ts`).
   `scripts/test-glass-tokens.mjs` checks text contrast ≥ 4.5:1.
+- `native.ts` (G10b): asks the GUI crate's `native_glass` command for
+  `{ vibrancy, reduceTransparency }` at mount and on each window focus.
+  With vibrancy (macOS) it adds `html.glass-native`, which makes html and
+  body transparent so the `sidebar` material shows through the L0 tint
+  (Off opaque, Subtle 10%, Full 16%). Reduce Transparency forces
+  `data-glass="off"` without changing the pref. Classic never has the
+  class, so its opaque body stays. Preview: `glass-preview/native.spec.ts`.
 - `keys.ts`: the only keyboard handler (R7-SPEC §A.2). Pages register their
   keys with `usePageKeys`; a receipt page passes `receipt: true`.
   `scripts/test-glass-keys.mjs` covers text fields, IME and receipts.
@@ -165,7 +172,7 @@ G10a 今天 / 用量 / 設定 (host pages, `pages/`):
   (the page says 「日期依 UTC 計」), not local days.
 - `Settings.svelte`: Shell (glass → Classic asks first: Classic has no
   switch back yet), Glass Off / Subtle / Full (`ui.glass`, sets
-  `data-glass`; native vibrancy is G10b), monthly fee, 重新排列房間 (off
+  `data-glass`), monthly fee, 重新排列房間 (off
   until the office extension), Extensions (read-only, from `ext/registry`),
   規則與授權 (shell only; the fixture shows the 允許 rule as
   「設計預覽，不會儲存」).

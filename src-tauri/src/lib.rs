@@ -36,6 +36,9 @@ pub use session::subscription_usage;
 /// `c9ext://` extension files and `ext_list` (glass G7).
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod ext;
+/// Native vibrancy and Reduce Transparency for the glass shell (G10b).
+#[cfg(all(not(mobile), feature = "gui"))]
+pub mod glass_native;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod web_server;
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -1077,6 +1080,7 @@ pub fn run() {
             get_debug_logs,
             get_build_channel,
             ext::ext_list,
+            glass_native::native_glass,
             bridge::c9p_request,
             bridge::c9p_subscribe,
             bridge::c9p_unsubscribe

@@ -16,6 +16,8 @@ export interface VisualOptions {
 	sessions?: 'full' | 'empty';
 	/** When set, `stop_session` rejects with this message. */
 	stopError?: string | null;
+	/** Glass G10b `native_glass`. Default: no vibrancy, Reduce Transparency off. */
+	nativeGlass?: { vibrancy: boolean; reduceTransparency: boolean };
 }
 
 declare global {
@@ -119,6 +121,9 @@ function handle(cmd: string, args: Args): unknown {
 		case 'ext_list':
 			// Glass G7. Classic never calls it; glass sees no extensions.
 			return { extensions: [] };
+		case 'native_glass':
+			// Glass G10b. Classic never calls it.
+			return options.nativeGlass ?? { vibrancy: false, reduceTransparency: false };
 		case 'stop_session':
 			if (options.stopError) throw options.stopError;
 			return null;
