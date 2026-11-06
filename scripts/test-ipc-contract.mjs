@@ -75,7 +75,9 @@ test('data-layer commands have capabilities for each supported window', () => {
     'create_pairing_code', 'forget_paired_clients', 'get_remote_access',
     'set_remote_access', 'get_debug_logs', 'opencode_connection_status',
     'opencode_connect', 'get_notification_preferences',
-    'save_notification_preferences', 'test_native_notification'
+    'save_notification_preferences', 'test_native_notification',
+    // Glass G7: the extension list is for the main window's glass shell.
+    'ext_list'
   ]);
   for (const command of mainOnly) assert.ok(invoked.has(command), `stale main-only command: ${command}`);
   for (const [file, window] of [['default.json', 'main'], ['popover.json', 'popover']]) {

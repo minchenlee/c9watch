@@ -33,6 +33,9 @@ pub mod polling;
 pub mod remote_access;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub use session::subscription_usage;
+/// `c9ext://` extension files and `ext_list` (glass G7).
+#[cfg(all(not(mobile), feature = "gui"))]
+pub mod ext;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod web_server;
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -827,6 +830,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_sharekit::init());
+    #[cfg(not(mobile))]
+    let builder = ext::register(builder);
 
     // macOS: NSPanel plugin for popover (must appear above fullscreen apps)
     #[cfg(target_os = "macos")]
@@ -836,6 +841,8 @@ pub fn run() {
     let builder = builder
         .setup(|app| {
             notifications::initialize(app.handle()).map_err(std::io::Error::other)?;
+            // Extension roots, found once (D31 Q13: add a directory, restart).
+            app.manage(ext::ExtRoots::discover(app.handle()));
             // ── WebSocket server ────────────────────────────────
             let port = web_server::WS_PORT;
 
@@ -1069,6 +1076,7 @@ pub fn run() {
             set_remote_access,
             get_debug_logs,
             get_build_channel,
+            ext::ext_list,
             bridge::c9p_request,
             bridge::c9p_subscribe,
             bridge::c9p_unsubscribe

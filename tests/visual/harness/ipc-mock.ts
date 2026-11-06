@@ -116,6 +116,9 @@ function handle(cmd: string, args: Args): unknown {
 		case 'get_build_channel':
 			// `dev` skips the startup update check, so no update banner shows.
 			return 'dev';
+		case 'ext_list':
+			// Glass G7. Classic never calls it; glass sees no extensions.
+			return { extensions: [] };
 		case 'stop_session':
 			if (options.stopError) throw options.stopError;
 			return null;

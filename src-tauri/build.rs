@@ -48,6 +48,7 @@ fn main() {
             "set_remote_access",
             "get_debug_logs",
             "get_build_channel",
+            "ext_list",
             "opencode_connection_status",
             "opencode_connect",
             "get_notification_preferences",
