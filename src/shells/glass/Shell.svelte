@@ -5,7 +5,8 @@
     import './tokens.css';
     import { onMount } from 'svelte';
     import { route, routeHash, type GlassRoute } from './nav';
-    import { startGlassData, sessions, agents, annotations, fixtureOn } from './data';
+    import { startGlassData, sessions, agents, annotations, fixtureOn, model } from './data';
+    import type { WorkspaceView } from './model';
     import { DEMO_NEEDS, DEMO_WORKSPACES } from './model/gaps-demo';
     import { installKeys } from './keys';
     import { glassMode, sidebarCollapsed } from './prefs';
@@ -30,17 +31,23 @@
     }));
 
     type PageInfo = { title: string; empty: string };
-    function pageInfo(r: GlassRoute): PageInfo {
+    // Workspace title: the model's name (demo names only while the fixture is
+    // on), then the fixture list while it is on, then the route id. Live mode
+    // never shows a fixture name.
+    function wsTitle(id: string, fixture: boolean, live: WorkspaceView[]): string {
+        return live.find(w => w.id === id)?.name ?? (fixture ? DEMO_WORKSPACES.find(w => w.id === id)?.name : undefined) ?? id;
+    }
+    function pageInfo(r: GlassRoute, fixture: boolean, live: WorkspaceView[]): PageInfo {
         switch (r.page) {
             case 'needs': return { title: '需要你', empty: '需要你處理的事會出現在這裡' };
             case 'today': return { title: '今天', empty: '你離開之後發生的事會出現在這裡' };
-            case 'ws': return { title: DEMO_WORKSPACES.find(w => w.id === r.id)?.name ?? r.id, empty: '這個 workspace 的 agent 會出現在這裡' };
+            case 'ws': return { title: wsTitle(r.id, fixture, live), empty: '這個 workspace 的 agent 會出現在這裡' };
             case 'ext': return { title: r.extId, empty: '沒有這個 extension 頁面' };
             case 'usage': return { title: '用量', empty: '花費和 token 用量會出現在這裡' };
             case 'settings': return { title: '設定', empty: '設定會出現在這裡' };
         }
     }
-    $: info = pageInfo($route);
+    $: info = pageInfo($route, $fixtureOn, $model.workspaces);
     const pageKey = (r: GlassRoute) => routeHash(r).slice(2);
 </script>
 

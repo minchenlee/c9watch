@@ -112,6 +112,20 @@ test.describe('glass preview (not a baseline)', () => {
 		await shot(page, 'glass-frame-live');
 	});
 
+	test('live mode never shows a fixture title on a workspace route', async ({ page }) => {
+		for (const [id, name] of [['cross', '跨專案'], ['c9watch', 'C9WATCH'], ['flockbook', 'FLOCKBOOK'], ['jumpmark', 'JUMPMARK']]) {
+			await openClassic(page, { path: `/#/ws/${id}`, storage: { 'ui.shell': 'glass' } });
+			await expect(page.locator('.glass-root')).toHaveAttribute('data-page', `ws/${id}`);
+			await expect(page.locator('.glass-page h1')).toHaveText(id);
+			await expect(page.getByText(name, { exact: true })).toHaveCount(0);
+		}
+	});
+
+	test('fixture mode keeps the demo workspace title', async ({ page }) => {
+		await openClassic(page, { ...glass, path: '/#/ws/cross' });
+		await expect(page.locator('.glass-page h1')).toHaveText('跨專案');
+	});
+
 	test('demo mode without demoGlass shows no demo workspaces', async ({ page }) => {
 		await openClassic(page, { storage: { 'ui.shell': 'glass', demoMode: 'true' } });
 		await expect(page.locator('.glass-side .state-msg')).toBeVisible();
