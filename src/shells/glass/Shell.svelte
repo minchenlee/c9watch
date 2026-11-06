@@ -13,6 +13,7 @@
     import Sidebar from './Sidebar.svelte';
     import Workspace from './pages/Workspace.svelte';
     import Needs from './pages/Needs.svelte';
+    import ExtPages from './ext/ExtPages.svelte';
 
     // startGlassData returns its stop function, which Svelte runs on unmount.
     onMount(startGlassData);
@@ -71,7 +72,7 @@
     {/if}
     {#if $route.page === 'needs'}
         <div class="glass-page full"><Needs /></div>
-    {:else}
+    {:else if $route.page !== 'ext'}
         <main class="glass-page" aria-label={info.title}>
             {#if $route.page === 'ws'}
                 <Workspace id={$route.id} title={info.title} />
@@ -81,6 +82,8 @@
             {/if}
         </main>
     {/if}
+    <!-- Extension pages (G6). Always mounted: it keeps the last one alive. -->
+    <ExtPages route={$route} />
     {#if hint}
         <div class="hint glass-float" role="status">
             {#if hint === 'delegate'}

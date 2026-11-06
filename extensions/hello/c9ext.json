@@ -1,0 +1,12 @@
+{
+  "c9ext": 1,
+  "id": "hello",
+  "name": "Hello",
+  "version": "0.1.0",
+  "dev": true,
+  "minVersion": { "apiMinor": 1 },
+  "ui": {
+    "contract": "c9ui/1",
+    "pages": [{ "id": "main", "title": "Hello", "entry": "index.js" }]
+  }
+}

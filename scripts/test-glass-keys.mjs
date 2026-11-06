@@ -131,3 +131,33 @@ test('modifier combinations outside the contract are ignored', () => {
   }
   assert.equal(keys.resolveKey({ code: 'KeyN', ctrlKey: true }, false), 'delegate');
 });
+
+test('a key from inside an extension goes to the extension; forwardKey hands it back', () => {
+  const { calls, shell, page } = harness();
+  const off = keys.usePageKeys(page);
+  const extHost = { tagName: 'DIV', hasAttribute: n => n === 'data-c9ext-host' };
+  const inExt = (target, code, mods = {}) => {
+    const e = { code, target: extHost, prevented: false, ...mods,
+      composedPath: () => [target, extHost, { tagName: 'MAIN', hasAttribute: () => false }],
+      preventDefault() { this.prevented = true; }, stopPropagation() {} };
+    return e;
+  };
+  const stopInstall = keys.installKeys({ addEventListener() {}, removeEventListener() {} }, shell);
+  // J, K, [ and 1 from inside the extension: the shell leaves them alone.
+  for (const code of ['KeyJ', 'KeyK', 'BracketLeft', 'Digit1']) assert.equal(keys.handleKey(inExt(button, code), shell), null, code);
+  // ⌘K, ⌘N and Esc: the shell still takes them first.
+  assert.equal(keys.handleKey(inExt(button, 'KeyK', { metaKey: true }), shell), 'search');
+  assert.equal(keys.handleKey(inExt(button, 'KeyN', { metaKey: true }), shell), 'delegate');
+  assert.equal(keys.handleKey(inExt(button, 'Escape'), shell), 'escape');
+  // Forwarded: the page handles J / K.
+  assert.equal(keys.forwardKey(inExt(button, 'KeyJ')), 'next');
+  assert.equal(keys.forwardKey(inExt(button, 'KeyK')), 'prev');
+  // A forwarded key typed in the extension's own text field stays typing:
+  // the composed path, not the retargeted shadow host, decides.
+  assert.equal(keys.forwardKey(inExt(input, 'KeyJ')), null);
+  assert.equal(keys.handleKey({ code: 'KeyJ', target: extHost, composedPath: () => [input, extHost], preventDefault() {}, stopPropagation() {} }, shell), null);
+  stopInstall();
+  assert.equal(keys.forwardKey(inExt(button, 'KeyJ')), null, 'no shell installed: nothing runs');
+  off();
+  assert.deepEqual(calls, ['search', 'delegate', 'shell-escape', 'page-escape', 'next', 'prev']);
+});

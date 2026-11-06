@@ -43,7 +43,7 @@ G1 frame:
   keys with `usePageKeys`; a receipt page passes `receipt: true`.
   `scripts/test-glass-keys.mjs` covers text fields, IME and receipts.
 - `Sidebar.svelte`: 需要你 → 今天 → workspaces (lead and talk rows) →
-  extension slot (empty) → 用量 / 設定. `[` collapses it to a
+  extension pages → 用量 / 設定. `[` collapses it to a
   「需要你 · N」 button. ⌘N shows a `c9watch spawn` hint (no delegate in v1).
 
 G3 workspace page (`#/ws/<id>`, `pages/Workspace.svelte`):
@@ -74,3 +74,26 @@ G4 需要你 page (read-only):
   `localStorage['c9watch.demoGlassOffline'] = '1'` with the fixture on.
 - No action sends anything yet (G5): a send button without a handler is
   off and reads 「預覽版：還不能從這裡送出」.
+
+G6 extension host (`ext/`, glass build plan §3, manifest per owner D41 R1–R12):
+
+- `manifest.ts`: validates `c9ext.json` (strict JSON, `c9ext: 1`,
+  `ui.contract: "c9ui/1"`, id = directory name, ≤ 64 KiB, ≤ 16 pages).
+  Status: `ok` / `manifest_error` / `version_mismatch` / `shadowed` /
+  `dev_only`. The `core` block is never run. Tests: `scripts/test-glass-ext.mjs`.
+- `registry.ts`: Tauri asks `localCommand('ext_list')` (G7; until then the
+  list is empty), `vite dev` asks `/c9ext/_list`
+  (`scripts/vite-c9ext-dev.mjs`: repo `extensions/` first, then
+  `$C9WATCH_ENGINE_HOME/extensions/`). Both send raw manifest text
+  (`ExtCandidate`); the host validates.
+- `ExtPages.svelte` + `Mount.svelte`: `import()` the page entry into a
+  shadow root, `mount(root, host)`; 5 s without `ready()` shows
+  「extension 沒有回應」, a throw shows 「extension 停止了」. The timeout
+  covers async hangs only: a synchronous loop freezes the window, the same
+  as any trusted npm package (D31: same document, no iframe or worker). The last page
+  stays mounted (`suspend` / `resume`). On an extension page J / K step
+  `context.needsItemId` through the needs queue.
+- Keys: a key from inside an extension goes to the extension first, except
+  ⌘K, ⌘N and Esc; it sends unused keys back with `host.keys.forward`.
+- `extensions/hello/` is `dev: true`: dev builds only. Tests:
+  `npx playwright test -c tests/glass/playwright.config.ts` (vite dev, port 4181).

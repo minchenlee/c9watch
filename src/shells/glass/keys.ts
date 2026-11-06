@@ -8,6 +8,10 @@
  * - While an input method composes, every key goes to the input method.
  * - Letters are matched by `KeyboardEvent.code` (`KeyJ`), not `key`, so J / K
  *   work under a Chinese input method too.
+ * - A key from inside an extension (an element marked `data-c9ext-host`)
+ *   goes to the extension first. The shell still takes ⌘K, ⌘N and Esc in
+ *   the capture phase; the extension sends the keys it does not use back
+ *   with `forwardKey` (glass build plan §3.3, D33 Q9).
  *
  * No imports: the node unit test loads this file on its own. */
 
@@ -106,20 +110,45 @@ export function usePageKeys(keys: PageKeys): () => void {
     return () => { const i = pages.lastIndexOf(keys); if (i >= 0) pages.splice(i, 1); };
 }
 
-type EventLike = KeyLike & { target?: unknown; preventDefault(): void; stopPropagation(): void };
+type EventLike = KeyLike & { target?: unknown; composedPath?(): unknown[]; preventDefault(): void; stopPropagation(): void };
+type NodeLike = { hasAttribute?(name: string): boolean } | null | undefined;
 
-/** Handles one keydown. Exported for the unit test. */
-export function handleKey(e: EventLike, shell: ShellKeys): Command | null {
-    const typing = isTextField(e.target as ElementLike);
+/** Keys the shell takes even from inside an extension. */
+const SHELL_FIRST: ReadonlySet<Command> = new Set(['search', 'delegate', 'escape']);
+
+/** The element the key really came from. In a shadow root `target` is the
+ * shadow host; the composed path starts at the focused element. */
+function origin(e: EventLike): unknown {
+    return e.composedPath?.()[0] ?? e.target;
+}
+const fromExtension = (e: EventLike) => (e.composedPath?.() ?? []).some(n => (n as NodeLike)?.hasAttribute?.('data-c9ext-host'));
+
+function run(e: EventLike, shell: ShellKeys, forwarded: boolean): Command | null {
+    const at = origin(e);
+    const typing = isTextField(at as ElementLike);
     const cmd = resolveKey(e, typing);
     if (!cmd) return null;
+    if (!forwarded && !SHELL_FIRST.has(cmd) && fromExtension(e)) return null;
     const done = runCommand(cmd, shell, pages[pages.length - 1]);
     // Esc in a text field with nothing to close leaves the field.
-    if (!done && cmd === 'escape' && typing) (e.target as { blur?: () => void }).blur?.();
+    if (!done && cmd === 'escape' && typing) (at as { blur?: () => void }).blur?.();
     if (!done) return null;
     e.preventDefault();
     e.stopPropagation();
     return cmd;
+}
+
+/** Handles one keydown. Exported for the unit test. */
+export function handleKey(e: EventLike, shell: ShellKeys): Command | null {
+    return run(e, shell, false);
+}
+
+let installed: ShellKeys | null = null;
+
+/** An extension sends back a key it does not use (`host.keys.forward`).
+ * The shell then handles it as if it came from the page. */
+export function forwardKey(e: EventLike): Command | null {
+    return installed ? run(e, installed, true) : null;
 }
 
 /** Installs the contract in the capture phase of `target` (the window).
@@ -127,5 +156,6 @@ export function handleKey(e: EventLike, shell: ShellKeys): Command | null {
 export function installKeys(target: EventTarget, shell: ShellKeys): () => void {
     const fn = (e: Event) => { handleKey(e as unknown as EventLike, shell); };
     target.addEventListener('keydown', fn, true);
-    return () => target.removeEventListener('keydown', fn, true);
+    installed = shell;
+    return () => { target.removeEventListener('keydown', fn, true); if (installed === shell) installed = null; };
 }

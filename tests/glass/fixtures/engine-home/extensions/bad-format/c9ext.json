@@ -1,0 +1,2 @@
+{ "c9ext": 2, "id": "bad-format", "name": "Bad format", "version": "1.0.0",
+  "ui": { "contract": "c9ui/1", "pages": [{ "id": "main", "title": "Bad format", "entry": "index.js" }] } }

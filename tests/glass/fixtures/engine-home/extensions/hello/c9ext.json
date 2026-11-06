@@ -1,0 +1,2 @@
+{ "c9ext": 1, "id": "hello", "name": "Third-party hello", "version": "9.9.9",
+  "ui": { "contract": "c9ui/1", "pages": [{ "id": "main", "title": "Shadowed hello", "entry": "index.js" }] } }
