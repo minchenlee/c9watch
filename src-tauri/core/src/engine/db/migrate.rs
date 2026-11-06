@@ -82,6 +82,11 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0012_agent_parent.sql"),
         fk_off: false,
     },
+    Migration {
+        version: 13,
+        sql: include_str!("migrations/0013_agent_overlay.sql"),
+        fk_off: false,
+    },
 ];
 
 /// The schema version this engine writes.
@@ -297,7 +302,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             migrate(&mut conn, MIGRATIONS, t.path()).unwrap(),
-            [5, 6, 7, 8, 9, 10, 11, 12]
+            [5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
         assert_eq!(user_version(&conn).unwrap(), latest_version());
         let backup = Connection::open(t.path().join("pre-5.db")).unwrap();
@@ -355,7 +360,7 @@ mod tests {
         migrate(&mut conn, &MIGRATIONS[..9], t.path()).unwrap();
         assert_eq!(
             migrate(&mut conn, MIGRATIONS, t.path()).unwrap(),
-            [10, 11, 12]
+            [10, 11, 12, 13]
         );
         let backup = Connection::open(t.path().join("pre-10.db")).unwrap();
         assert_eq!(user_version(&backup).unwrap(), 9);
@@ -398,7 +403,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             migrate(&mut conn, MIGRATIONS, t.path()).unwrap(),
-            [9, 10, 11, 12]
+            [9, 10, 11, 12, 13]
         );
         assert_eq!(user_version(&conn).unwrap(), latest_version());
         let backup = Connection::open(t.path().join("pre-9.db")).unwrap();

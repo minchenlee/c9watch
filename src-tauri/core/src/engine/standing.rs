@@ -35,11 +35,16 @@
 //!   that fakes one, and how to send mail. They are not part of the
 //!   orders file, so an empty or missing file still sends them, and a
 //!   compaction gets the token back.
+//! - An agent created with `overlay.standingOrders` (E1) gets that text
+//!   last, after all of the engine's text, fenced and labelled as the
+//!   caller's (`overlay::caller_orders`). It goes out with every block,
+//!   as the orders do.
 
 use super::db::Tx;
 use super::drain::{self, InjectionPath};
 use super::hooks::{self, DropReason, HookEvent, Outcome};
 use super::merge::MergeTable;
+use super::overlay;
 use crate::elog;
 use rusqlite::params;
 use std::io::{Read, Write};
@@ -226,6 +231,16 @@ pub fn context(
     format!("{}\n\n{}", header(gen), parts.join("\n"))
 }
 
+/// `ctx` with the caller's standing orders block (E1,
+/// `overlay::caller_orders`) after all of the engine's own text, set apart
+/// by a blank line.
+pub fn with_caller_orders(ctx: String, caller: Option<&str>) -> String {
+    match caller {
+        Some(c) => format!("{}\n{}", ctx, c),
+        None => ctx,
+    }
+}
+
 /// `hook.session_start`: the intake (`engine::hooks`), and in the same
 /// transaction the interrupted note. Returns the outcome and the context
 /// to send. An accepted event gets the orders; a duplicate (the hook's
@@ -258,6 +273,13 @@ pub fn session_start(
         }
         Outcome::Dropped(DropReason::Duplicate) => Some(context(orders, id, ev.gen, false, token)),
         Outcome::Dropped(_) => None,
+    };
+    let ctx = match ctx {
+        Some(c) => Some(with_caller_orders(
+            c,
+            overlay::row_caller_orders(tx, id)?.as_deref(),
+        )),
+        None => None,
     };
     Ok((out, ctx))
 }
@@ -616,5 +638,49 @@ mod tests {
             "path=hook".to_string(),
         );
         assert_eq!(blocked, vec![one.clone(), one]);
+    }
+
+    #[test]
+    fn caller_orders_come_last_fenced_on_every_start() {
+        let (_t, db, merge) = setup();
+        db.write_blocking(|tx| {
+            tx.execute(
+                "UPDATE agents SET created_by = 'local-unverified', \
+                 overlay = '{\"standingOrders\":\"Only touch docs/.\"}' WHERE id = 'a1'",
+                [],
+            )
+        })
+        .unwrap();
+        let caller = overlay::caller_orders("Only touch docs/.", Some("local-unverified"));
+        let want = format!("{}\n{}", block(1, "Be agent a1.\n"), caller);
+        let (out, ctx) = start(&db, &merge, 1, "startup", "1");
+        assert_eq!(out, Outcome::Accepted);
+        assert_eq!(ctx.as_deref(), Some(want.as_str()));
+        assert!(want.ends_with("Only touch docs/.\n[end caller orders]\n"));
+        // A compaction and a retry get it again.
+        assert_eq!(
+            start(&db, &merge, 1, "compact", "2").1.as_deref(),
+            Some(want.as_str())
+        );
+        assert_eq!(
+            start(&db, &merge, 1, "compact", "2").1.as_deref(),
+            Some(want.as_str())
+        );
+        // A drain sends nothing, the caller's text included.
+        assert_eq!(start_as(&db, &merge, 1, "clear", "3", true).1, None);
+    }
+
+    #[test]
+    fn an_agent_without_caller_orders_gets_the_same_block_as_before() {
+        let (_t, db, merge) = setup();
+        db.write_blocking(|tx| {
+            tx.execute(
+                "UPDATE agents SET overlay = '{\"model\":\"opus\"}' WHERE id = 'a1'",
+                [],
+            )
+        })
+        .unwrap();
+        let (_, ctx) = start(&db, &merge, 1, "startup", "1");
+        assert_eq!(ctx.as_deref(), Some(block(1, "Be agent a1.\n").as_str()));
     }
 }

@@ -460,7 +460,7 @@ impl AgentFilter {
 pub const AGENT_COLUMNS: &str = "id, generation, mode, role, control, provider, provider_sid, \
      source, created_by, gone_at, resume_count, interrupted_note_pending, session_key, \
      machine_id, state, status, cwd, name, pid, started_at, created_at, last_seen, parent_id, \
-     state_reason, guard, cc_version, capabilities";
+     state_reason, guard, cc_version, capabilities, overlay";
 
 /// A JSON column as `T`, `None` when it is null.
 fn json_col<T: serde::de::DeserializeOwned>(
@@ -506,6 +506,7 @@ pub fn agent_row(r: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
         guard: json_col(r, 24)?,
         cc_version: r.get(25)?,
         capabilities: json_col(r, 26)?,
+        overlay: json_col(r, 27)?,
     })
 }
 
@@ -809,7 +810,8 @@ mod tests {
                 "resume_argv",
                 "guard",
                 "cc_version",
-                "capabilities"
+                "capabilities",
+                "overlay"
             ]
         );
     }
@@ -1208,6 +1210,7 @@ mod tests {
                 guard: None,
                 cc_version: None,
                 capabilities: None,
+                overlay: None,
             }
         );
         assert_eq!(db.check_cursor(&cur), Ok(1));

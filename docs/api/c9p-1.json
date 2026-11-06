@@ -76,6 +76,17 @@
             "null"
           ]
         },
+        "overlay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentOverlay"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Additions to the spawn under the engine's rules (`AgentOverlay`).\nAn agent may pass all but `model`; its child always gets the\nparent's `permissionsDeny` and `sandboxDenyWrite` as well, so a\nchild is never less restricted than its parent."
+        },
         "require": {
           "description": "Capability tokens the spawned Claude Code must have (see\n`AgentRow.capabilities`). A missing one answers `unsupported` and\nspawns nothing. Without it, an untested version only warns.",
           "items": {
@@ -210,6 +221,45 @@
       "required": [
         "agents"
       ],
+      "type": "object"
+    },
+    "AgentOverlay": {
+      "additionalProperties": false,
+      "description": "Caller additions to one agent's spawn, applied under the engine's own\nrules: each field can only add a restriction, pick a model or add\ntext. Nothing here can allow a tool, a path, a hook, an env var or an\nMCP server. Unknown fields are refused.",
+      "properties": {
+        "model": {
+          "description": "The Claude Code `--model`: 1 to 64 of letters, digits, `.`, `_`,\n`-`, `[` and `]`, not starting with `-`. Not from an agent: a child\nof an agent runs the\nparent's model.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "permissionsDeny": {
+          "description": "Claude Code permission rules added to the spawn's\n`permissions.deny`. At most 64, each 1 to 512 bytes with no\ncontrol character. No `!` anywhere, and a path tool's (`Read`,\n`Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `NotebookRead`,\n`Glob`, `Grep`, `LS`) specifier starts with `//` or `~/`; either is\n`not_allowed`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-sensitivity": "metadata"
+        },
+        "sandboxDenyWrite": {
+          "description": "Absolute paths added to the spawn's `sandbox.filesystem.denyWrite`\n(sandboxed Bash). At most 64, each at most 4096 bytes, with no\ncontrol character, quote, parenthesis, backslash or glob character\n(`*?[]{}`). An existing path is stored as its realpath, another one\nas given.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-sensitivity": "metadata"
+        },
+        "standingOrders": {
+          "description": "Text added after the engine's standing orders on every\nSessionStart, fenced and labelled as the caller's. At most 8 KiB\nof UTF-8.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "conversation"
+        }
+      },
       "type": "object"
     },
     "AgentResumeParams": {
@@ -402,6 +452,18 @@
             "null"
           ],
           "x-sensitivity": "conversation"
+        },
+        "overlay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentOverlay"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The spawn overlay the agent runs with (`agent.create` `overlay`),\nafter the engine checked it: `sandboxDenyWrite` as realpaths where\nthey existed, and for a child of an agent the parent's\n`permissionsDeny`, `sandboxDenyWrite` and `model` added. A resume\napplies the same overlay. `null` for an agent without one.",
+          "x-sensitivity": "metadata"
         },
         "parentId": {
           "description": "The agent that owns this one; for an imported legacy worker, the PM\nthat adopted it.",
@@ -4932,7 +4994,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 13,
+  "apiMinor": 14,
   "description": "Preview: the c9watch engine protocol. One JSON object per line over the engine socket. A preview minor may break a method; check breakingSince.",
   "frames": {
     "event": {

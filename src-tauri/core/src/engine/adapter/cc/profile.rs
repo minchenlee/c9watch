@@ -50,6 +50,7 @@ use crate::cli::task::{ENV_AGENT_ID, ENV_SOCK};
 use crate::engine::adapter::{claude_hook_settings, CLAUDE};
 use crate::engine::driver::SpawnSpec;
 use crate::engine::fsutil::ensure_private_dir;
+use crate::engine::proto::AgentOverlay;
 use crate::engine::standing::STANDING_ORDERS_NAME;
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -136,6 +137,10 @@ pub struct Profile {
     pub guarded: bool,
     /// The agent is a child of an agent (E5): `CHILD_ISOLATE_ARGS`.
     pub child: bool,
+    /// The agent's spawn overlay (E1), as the row stores it: its
+    /// `permissionsDeny` and `sandboxDenyWrite` go after the engine's own
+    /// entries, its `model` to `--model`. `None` changes nothing.
+    pub overlay: Option<AgentOverlay>,
 }
 
 impl Profile {
@@ -167,6 +172,7 @@ impl Profile {
             peers: Vec::new(),
             guarded: false,
             child: false,
+            overlay: None,
         })
     }
 
@@ -201,6 +207,12 @@ impl Profile {
     /// Spawn as a child of an agent (`Profile::child`).
     pub fn with_child(mut self, child: bool) -> Profile {
         self.child = child;
+        self
+    }
+
+    /// Apply the agent's spawn overlay (`Profile::overlay`).
+    pub fn with_overlay(mut self, overlay: Option<AgentOverlay>) -> Profile {
+        self.overlay = overlay;
         self
     }
 
@@ -413,7 +425,7 @@ pub fn settings(p: &Profile) -> Value {
     // 2.1.314, C1b-M1-3), and vim NORMAL mode shows nothing on screen to
     // detect it by.
     s["editorMode"] = json!("normal");
-    s["permissions"] = json!({ "allow": allow_rules(p), "deny": deny_rules(p) });
+    s["permissions"] = json!({ "allow": allow_rules(p), "deny": with_overlay(deny_rules(p), p.overlay.as_ref().map(|o| &o.permissions_deny)) });
     // Layer 3, allowUnsandboxedCommands false: no `dangerouslyDisableSandbox`
     // retry, so Bash cannot step around the write-deny (honored from a
     // `--settings` file, CC 2.1.312).
@@ -422,7 +434,7 @@ pub fn settings(p: &Profile) -> Value {
         "autoAllowBashIfSandboxed": true,
         "allowUnsandboxedCommands": false,
         "network": { "allowUnixSockets": unix_sockets(p) },
-        "filesystem": { "denyWrite": deny_write(p) },
+        "filesystem": { "denyWrite": with_overlay(deny_write(p), p.overlay.as_ref().map(|o| &o.sandbox_deny_write)) },
     });
     s["remoteControlAtStartup"] = json!(false);
     if p.guarded {
@@ -432,6 +444,17 @@ pub fn settings(p: &Profile) -> Value {
     #[cfg(feature = "live-test")]
     crate::engine::live_test::patch_settings(p, &mut s);
     s
+}
+
+/// The engine's entries, then the overlay's (E1) that are not among them
+/// yet. The overlay only adds: no engine entry is ever dropped.
+fn with_overlay(mut engine: Vec<String>, overlay: Option<&Vec<String>>) -> Vec<String> {
+    for e in overlay.into_iter().flatten() {
+        if !engine.contains(e) {
+            engine.push(e.clone());
+        }
+    }
+    engine
 }
 
 /// `<home>/spawn/<agent_id>-<generation>.json`
@@ -471,8 +494,8 @@ pub fn write_settings(home: &Path, p: &Profile) -> Result<PathBuf, String> {
 
 /// argv: `claude --session-id <uuid> --settings <file> --permission-mode
 /// auto` plus `ISOLATE_ARGS` (`CHILD_ISOLATE_ARGS` for a child of an
-/// agent); `--resume <uuid>` for a resume. No model: the
-/// user's default applies.
+/// agent); `--resume <uuid>` for a resume. `--model <m>` last when the
+/// overlay names one (E1); otherwise the user's default applies.
 pub fn argv(p: &Profile, claude: &Path, settings_file: &Path) -> Vec<OsString> {
     let session_flag = if p.resume { "--resume" } else { "--session-id" };
     let mut v: Vec<OsString> = vec![
@@ -489,6 +512,9 @@ pub fn argv(p: &Profile, claude: &Path, settings_file: &Path) -> Vec<OsString> {
         &ISOLATE_ARGS
     };
     v.extend(isolate.iter().map(OsString::from));
+    if let Some(m) = p.overlay.as_ref().and_then(|o| o.model.as_deref()) {
+        v.extend(["--model".into(), m.into()]);
+    }
     v
 }
 
@@ -1040,6 +1066,89 @@ mod tests {
         let dir = format!("{}/{}", HOME, crate::engine::live_test::DIR);
         assert!(deny_write(&p).contains(&dir));
         assert!(deny_rules(&p).contains(&format!("Edit(/{}/**)", dir)));
+    }
+
+    /// sha256 of the settings bytes and the argv of a bare spawn (no
+    /// overlay), with the tempdir cwd replaced by `<CWD>`. Taken from
+    /// the code before E1: a create without `overlay` must not change by
+    /// one byte.
+    #[cfg(not(feature = "live-test"))]
+    const BARE_SETTINGS_SHA: &str =
+        "708962bd45657a1721ab1751742236359f3fca898bd13809f1798b9ccd524d24";
+    #[cfg(not(feature = "live-test"))]
+    const BARE_ARGV_SHA: &str = "ac731f6ef7e0ca17a06bfc51b959df31837a5820a1054debc32692e508489873";
+    #[cfg(not(feature = "live-test"))]
+    const CHILD_SETTINGS_SHA: &str =
+        "c9ecaad79b31b821b9e64e487fc80f06224998d10d0c7b5d627b888ecd709a06";
+    #[cfg(not(feature = "live-test"))]
+    const CHILD_ARGV_SHA: &str = "0103b03f2291389ead0180e467a375408385c1843fa3f7f575e5ddb2a7b0d8bb";
+
+    #[cfg(not(feature = "live-test"))]
+    fn bare_digest(p: &Profile) -> (String, String) {
+        let cwd = p.cwd.display().to_string();
+        let body = String::from_utf8(serde_json::to_vec_pretty(&settings(p)).unwrap())
+            .unwrap()
+            .replace(&cwd, "<CWD>");
+        let argv = argv(p, Path::new("/x/claude"), Path::new("/h/spawn/a.json"))
+            .iter()
+            .map(|a| a.to_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join("\0");
+        let sha = |b: &[u8]| crate::engine::mail::sha256_hex(b);
+        (sha(body.as_bytes()), sha(argv.as_bytes()))
+    }
+
+    #[cfg(not(feature = "live-test"))]
+    #[test]
+    fn a_bare_spawn_is_byte_identical_to_before_the_overlay() {
+        with_cwd(|_, p| {
+            let plain = bare_digest(&p);
+            let child = bare_digest(&p.clone().with_guard(true).with_child(true).resuming());
+            assert_eq!(plain, (BARE_SETTINGS_SHA.into(), BARE_ARGV_SHA.into()));
+            assert_eq!(child, (CHILD_SETTINGS_SHA.into(), CHILD_ARGV_SHA.into()));
+            // `with_overlay(None)` is the bare spawn.
+            let none = bare_digest(&p.clone().with_overlay(None));
+            assert_eq!(none, (BARE_SETTINGS_SHA.into(), BARE_ARGV_SHA.into()));
+        });
+    }
+
+    /// E1: the overlay only adds, after the engine's entries; it touches
+    /// no other key.
+    #[test]
+    fn an_overlay_only_appends_to_the_deny_lists_and_the_argv() {
+        with_cwd(|_, p| {
+            let o = AgentOverlay {
+                model: Some("opus".into()),
+                permissions_deny: vec!["WebFetch".into(), deny_rules(&p)[0].clone()],
+                sandbox_deny_write: vec!["/nope/x".into()],
+                standing_orders: Some("text".into()),
+            };
+            let (bare, with) = (settings(&p), settings(&p.clone().with_overlay(Some(o))));
+            let mut deny = deny_rules(&p);
+            deny.push("WebFetch".into());
+            assert_eq!(with["permissions"]["deny"], json!(deny));
+            let mut dw = deny_write(&p);
+            dw.push("/nope/x".into());
+            assert_eq!(with["sandbox"]["filesystem"]["denyWrite"], json!(dw));
+            let mut rest = with.clone();
+            rest["permissions"]["deny"] = bare["permissions"]["deny"].clone();
+            rest["sandbox"]["filesystem"]["denyWrite"] =
+                bare["sandbox"]["filesystem"]["denyWrite"].clone();
+            assert_eq!(rest, bare);
+            assert!(!serde_json::to_string(&with).unwrap().contains("text\""));
+            let file = Path::new("/h/spawn/a.json");
+            let mut a = argv(&p, Path::new("/x/claude"), file);
+            a.extend(["--model".into(), "opus".into()]);
+            let o2 = p.clone().with_overlay(with_model("opus"));
+            assert_eq!(argv(&o2, Path::new("/x/claude"), file), a);
+        });
+    }
+
+    fn with_model(m: &str) -> Option<AgentOverlay> {
+        Some(AgentOverlay {
+            model: Some(m.into()),
+            ..Default::default()
+        })
     }
 }
 

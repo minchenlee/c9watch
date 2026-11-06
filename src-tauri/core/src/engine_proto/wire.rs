@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Preview breaks also raise method revisions.
-pub const API_MINOR: u32 = 13;
+pub const API_MINOR: u32 = 14;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -637,6 +637,13 @@ pub struct AgentRow {
     /// spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<String>>,
+    /// The spawn overlay the agent runs with (`agent.create` `overlay`),
+    /// after the engine checked it: `sandboxDenyWrite` as realpaths where
+    /// they existed, and for a child of an agent the parent's
+    /// `permissionsDeny`, `sandboxDenyWrite` and `model` added. A resume
+    /// applies the same overlay. `null` for an agent without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<AgentOverlay>,
 }
 
 /// A write fence for an agent's file tools: writes under any
@@ -652,6 +659,42 @@ pub struct AgentGuard {
     /// agent's cwd must be writable. At most 64.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_write: Vec<String>,
+}
+
+/// Caller additions to one agent's spawn, applied under the engine's own
+/// rules: each field can only add a restriction, pick a model or add
+/// text. Nothing here can allow a tool, a path, a hook, an env var or an
+/// MCP server. Unknown fields are refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentOverlay {
+    /// The Claude Code `--model`: 1 to 64 of letters, digits, `.`, `_`,
+    /// `-`, `[` and `]`, not starting with `-`. Not from an agent: a child
+    /// of an agent runs the
+    /// parent's model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Claude Code permission rules added to the spawn's
+    /// `permissions.deny`. At most 64, each 1 to 512 bytes with no
+    /// control character. No `!` anywhere, and a path tool's (`Read`,
+    /// `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `NotebookRead`,
+    /// `Glob`, `Grep`, `LS`) specifier starts with `//` or `~/`; either is
+    /// `not_allowed`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions_deny: Vec<String>,
+    /// Absolute paths added to the spawn's `sandbox.filesystem.denyWrite`
+    /// (sandboxed Bash). At most 64, each at most 4096 bytes, with no
+    /// control character, quote, parenthesis, backslash or glob character
+    /// (`*?[]{}`). An existing path is stored as its realpath, another one
+    /// as given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sandbox_deny_write: Vec<String>,
+    /// Text added after the engine's standing orders on every
+    /// SessionStart, fenced and labelled as the caller's. At most 8 KiB
+    /// of UTF-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_orders: Option<String>,
 }
 
 /// `session.list` params. There are none yet; the engine ignores any it
@@ -1173,6 +1216,12 @@ pub struct AgentCreateParams {
     /// spawns nothing. Without it, an untested version only warns.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub require: Vec<String>,
+    /// Additions to the spawn under the engine's rules (`AgentOverlay`).
+    /// An agent may pass all but `model`; its child always gets the
+    /// parent's `permissionsDeny` and `sandboxDenyWrite` as well, so a
+    /// child is never less restricted than its parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<AgentOverlay>,
 }
 
 fn default_kind() -> String {

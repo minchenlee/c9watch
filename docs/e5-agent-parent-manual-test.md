@@ -57,7 +57,10 @@ Each must fail with `not_allowed` and spawn nothing:
 - [ ] Inside `.git`: cwd `<R>/a/.git/x`.
 - [ ] A looser guard: `"guard":{"denyWriteUnder":["<R>/a"],"allowWrite":["<R>/a/k"]}`
       (drops the parent's deny on `<R>`).
-- [ ] An extra field: add `"overlay":{}` to a good create.
+- [ ] An extra field: add `"settings":{}` to a good create.
+- [ ] A model from an agent (E1): add `"overlay":{"model":"sonnet"}` to a
+      good create. (`"overlay":{}` and an overlay without `model` are
+      allowed since 1.14.)
 - [ ] Another binary: `"$C9" api agent.create '<good params>'` from the
       parent's Bash fails with `peer_not_authorized` (or `not_allowed`).
 
@@ -104,6 +107,32 @@ printf '{"mcpServers":{"x":{"command":"touch","args":["%s/e5-test/pwned-mcp"]}}}
 From one agent, the 9th live child fails with "live children"; a chain
 deeper than 3 below the root fails with "depth 4"; a tree past 16 live
 agents fails with "16 live agents".
+
+## 7. Spawn overlay (E1, c9p 1.14)
+
+`tests/live/e5_parent.sh` runs these checks as step 7.
+
+- [ ] From the terminal, create a root with `"overlay":{"model":"sonnet",
+      "permissionsDeny":["Bash(curl:*)"],"sandboxDenyWrite":["<dir>"],
+      "standingOrders":"..."}`. agent.list shows the same `overlay`.
+- [ ] Its `<home>/spawn/<id>-1.json` ends `permissions.deny` and
+      `sandbox.filesystem.denyWrite` with the overlay entries; the
+      engine's own `.claude` entries are still there.
+- [ ] Its CC command line ends with `--model sonnet`.
+- [ ] The `agent.create` audit row has `overlay {...}` in its reason and
+      a `payload_hash`.
+- [ ] In the root agent, a child create with
+      `"overlay":{"permissionsDeny":["WebFetch"]}` gives a child with the
+      parent's model, the parent's denies first, then `WebFetch`.
+- [ ] A child create with `"overlay":{"model":"haiku"}` is refused
+      (`not_allowed`). So are `"permissionsDeny":["Read(!*.env)"]` and
+      `"permissionsDeny":["Read(./secrets/**)"]`.
+- [ ] After `c9watch engine restart` the root's new spawn file and
+      `--resume` command line carry the same overlay.
+- [ ] Not checked by the script: whether CC enforces the added rules (a
+      `!` command runs outside CC's permissions and sandbox), and whether
+      the caller orders reach the model (INFO: grep the transcript for
+      `[end caller orders]`).
 
 ## Cleanup
 
