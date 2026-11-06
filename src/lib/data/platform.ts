@@ -32,6 +32,7 @@ export async function localCommand<T = unknown>(command: string, p?: any): Promi
         case 'save_notification_preferences': return invoke<T>('save_notification_preferences', p);
         case 'test_native_notification': return invoke<T>('test_native_notification');
         case 'get_build_channel': return invoke<T>('get_build_channel');
+        case 'ext_list': return invoke<T>('ext_list');
         default: throw new Error(`Unsupported platform command: ${command}`);
     }
 }

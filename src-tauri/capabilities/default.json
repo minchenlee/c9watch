@@ -44,6 +44,7 @@
     "allow-set-remote-access",
     "allow-get-debug-logs",
     "allow-get-build-channel",
+    "allow-ext-list",
     "allow-opencode-connection-status",
     "allow-opencode-connect",
     "allow-get-notification-preferences",

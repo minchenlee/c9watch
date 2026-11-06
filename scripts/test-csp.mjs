@@ -32,7 +32,8 @@ test('the desktop webview has a CSP in both build and dev', () => {
 
 test('scripts cannot run inline or from eval', () => {
   for (const csp of [security.csp, security.devCsp]) {
-    assert.equal(csp['script-src'], "'self'");
+    // c9ext: is the extension file scheme (glass G7): files from disk, no inline.
+    assert.equal(csp['script-src'], "'self' c9ext:");
     assert.doesNotMatch(csp['default-src'], /unsafe/);
     assert.equal(csp['object-src'], "'none'");
     assert.equal(csp['base-uri'], "'none'");
@@ -69,6 +70,15 @@ const allowedUrls = [
   // Documentation links in comments.
   { re: /^https:\/\/(svelte\.dev|v2\.tauri\.app)\// },
 ];
+
+test('c9ext: is allowed only where extensions load files', () => {
+  const want = ['script-src', 'style-src', 'img-src', 'font-src', 'connect-src'];
+  for (const csp of [security.csp, security.devCsp]) {
+    for (const [directive, value] of Object.entries(csp)) {
+      assert.equal(value.split(/\s+/).includes('c9ext:'), want.includes(directive), directive);
+    }
+  }
+});
 
 test('every URL the frontend references is covered by the CSP', () => {
   assert.ok(sources('connect-src').includes('https://api.github.com'));
