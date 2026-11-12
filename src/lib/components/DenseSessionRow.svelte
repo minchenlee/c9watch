@@ -7,6 +7,7 @@
 	import { awayActivity } from '$lib/stores/away';
 	import { awayActivityLabel, awayActivityShortLabel } from '$lib/session-utils';
 	import { getSessionStatusShortLabel } from '$lib/status-utils';
+	import SessionModelLabel from './SessionModelLabel.svelte';
 	import { formatTimeSince } from '$lib/time-utils';
 	import {
 		canSessionAction,
@@ -128,6 +129,7 @@
 			{#if session.gitBranch}
 				<span class="branch" title={`Branch: ${session.gitBranch}`}>{session.gitBranch}</span>
 			{/if}
+			<SessionModelLabel model={session.model} reasoningEffort={session.reasoningEffort} />
 			<span class="meta">
 				{#if health}
 					<span class="health" title={health.title}>{health.label}</span>

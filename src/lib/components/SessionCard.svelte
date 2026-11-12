@@ -4,6 +4,7 @@
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
 	import { formatCostOrTokens } from '$lib/cost-utils';
 	import { isCostAvailable } from '$lib/cost-semantics';
+	import SessionModelLabel from './SessionModelLabel.svelte';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { canSessionAction, sessionReturnKind, sessionKeyOf } from '$lib/provider';
 	import { awayActivity } from '$lib/stores/away';
@@ -215,6 +216,7 @@
 					{#if sourceHealthMeta}
 						<span class="source-health-badge {sourceHealthMeta.modifier}" title={sourceHealthMeta.title}>{sourceHealthMeta.label}</span>
 					{/if}
+					<SessionModelLabel model={session.model} reasoningEffort={session.reasoningEffort} />
 					<span class="session-name-badge">{session.sessionName}</span>
 				{#if isBackground}
 					<span class="kind-badge" aria-label="Background-pinned session" title="Background-pinned session">BG</span>

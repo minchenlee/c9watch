@@ -1361,6 +1361,8 @@ export interface C9pSessionView {
   lastAssistantMessage?: string | null;
   latestMessage: string;
   messageCount: number;
+  /** Last reported model for this session. */
+  model?: string | null;
   modified: string;
   /**
    * User-set name from `claude agents` (Ctrl+T background-pinned sessions).
@@ -1376,6 +1378,8 @@ export interface C9pSessionView {
   pid: number;
   projectPath: string;
   provider: C9pSessionProvider;
+  /** Reasoning effort recorded for the current or most recent turn. */
+  reasoningEffort?: string | null;
   rootSessionId?: string | null;
   /** Provider-scoped identity used by frontend selection and backend maps. */
   sessionKey: string;

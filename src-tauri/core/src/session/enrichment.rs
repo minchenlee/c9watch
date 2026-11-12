@@ -50,6 +50,10 @@ pub struct Session {
     pub ai_title: Option<String>,
     pub project_path: String,
     pub git_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub first_prompt: String,
     pub summary: Option<String>,
     pub message_count: u32,
@@ -309,6 +313,8 @@ pub fn enrich_detected_sessions(
                 session_name: default_session_name(&detected, &custom_names, &session_id),
                 custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
                 codex_title: crate::session::codex::get_cached_codex_thread_title(&session_id),
+                model: summary.model.clone(),
+                reasoning_effort: summary.reasoning_effort.clone(),
                 first_prompt: summary
                     .first_prompt()
                     .map(|prompt| truncate_string(prompt, 100))
@@ -596,6 +602,14 @@ pub fn enrich_detected_sessions(
             pending_tool_name.as_deref(),
         );
 
+        let model = entries.iter().rev().find_map(|entry| match entry {
+            SessionEntry::Assistant { message, .. }
+                if !message.model.trim().is_empty() && message.model != "<synthetic>" =>
+            {
+                Some(message.model.clone())
+            }
+            _ => None,
+        });
         let latest_message = get_latest_message_from_entries(&entries);
         let notification_preview = notification_preview_from_entries(&entries);
         let pending_tool_input = match &hook_prompt {
@@ -656,6 +670,8 @@ pub fn enrich_detected_sessions(
             codex_title: None,
             cursor_title: None,
             ai_title: native_titles.ai,
+            model,
+            reasoning_effort: None,
             project_path: detected.cwd.to_string_lossy().to_string(),
             git_branch,
             first_prompt,
@@ -711,6 +727,8 @@ fn base_session(detected: &DetectedSession, session_id: &str) -> Session {
         codex_title: None,
         cursor_title: None,
         ai_title: None,
+        model: None,
+        reasoning_effort: None,
         project_path: detected.cwd.to_string_lossy().to_string(),
         git_branch: None,
         first_prompt: String::new(),
@@ -1204,6 +1222,8 @@ impl Session {
             codex_title: None,
             cursor_title: None,
             ai_title: None,
+            model: None,
+            reasoning_effort: None,
             project_path: "/tmp/project".to_string(),
             git_branch: None,
             first_prompt: "investigate".to_string(),

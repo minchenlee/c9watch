@@ -218,6 +218,7 @@ const BY_NAME: &[(&str, &str)] = &[
     ("percentage", M),
     ("usedPercent", M),
     ("model", M),
+    ("reasoningEffort", M),
     ("displayName", M),
     ("plan", M),
     ("label", M),

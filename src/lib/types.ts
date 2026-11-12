@@ -46,6 +46,8 @@ export interface AwayRequest {
  * A Claude Code session
  */
 export interface Session {
+  model?: string | null;
+  reasoningEffort?: string | null;
   /** Session UUID */
   id: string;
 

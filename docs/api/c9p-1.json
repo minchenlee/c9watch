@@ -4209,6 +4209,14 @@
           "type": "integer",
           "x-sensitivity": "public"
         },
+        "model": {
+          "description": "Last reported model for this session.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
         "modified": {
           "type": "string",
           "x-sensitivity": "public"
@@ -4264,6 +4272,14 @@
         "provider": {
           "$ref": "#/$defs/SessionProvider",
           "x-sensitivity": "public"
+        },
+        "reasoningEffort": {
+          "description": "Reasoning effort recorded for the current or most recent turn.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
         },
         "rootSessionId": {
           "type": [
