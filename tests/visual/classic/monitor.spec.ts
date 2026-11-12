@@ -1,4 +1,4 @@
-import { test, type Page } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { openClassic, settle, snap } from '../harness/classic';
 
 const card = (page: Page, title: string) => page.locator('.session-card', { hasText: title });
@@ -7,6 +7,39 @@ test.describe('monitor tab', () => {
 	test('grouped by project', async ({ page }) => {
 		await openClassic(page);
 		await snap(page, 'monitor-project');
+	});
+
+	test('sorts project groups and remembers the selected order', async ({ page }) => {
+		await openClassic(page);
+		const sort = page.getByRole('combobox', { name: 'Sort sessions' });
+		const projects = page.locator('.project-section .project-name');
+
+		await expect(projects).toHaveText(['web-app', 'api-server', 'cli-tools']);
+		await sort.selectOption('project');
+		await expect(projects).toHaveText(['api-server', 'cli-tools', 'web-app']);
+		await sort.selectOption('last-active');
+		await expect(projects).toHaveText(['cli-tools', 'web-app', 'api-server']);
+		await expect.poll(() => page.evaluate(() => localStorage.getItem('monitorSort')))
+			.toBe('last-active');
+	});
+
+	test('sorts sessions within a status group by last activity', async ({ page }) => {
+		await openClassic(page, { storage: { sessionViewMode: 'all', monitorSort: 'last-active' } });
+		const sort = page.getByRole('combobox', { name: 'Sort sessions' });
+		const attention = page.locator('.project-section')
+			.filter({ has: page.locator('.status-header.attention') })
+			.locator('.session-card');
+
+		await expect(sort).toHaveValue('last-active');
+		await expect(attention).toHaveText([
+			/OAuth2 login with Google and GitHub/,
+			/Rate limiter cache backend/
+		]);
+		await sort.selectOption('project');
+		await expect(attention).toHaveText([
+			/Rate limiter cache backend/,
+			/OAuth2 login with Google and GitHub/
+		]);
 	});
 
 	test('grouped by project, tall window shows every card', async ({ page }) => {
