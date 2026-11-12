@@ -37,6 +37,15 @@ test('tiles: rows grouped by status, oldest session first, id breaks ties', () =
   assert.deepEqual(tile.sessions.map(x => x.id), ['a1', 'a2', 'i1', 'w2', 'wa', 'wb']);
 });
 
+test('tiles: respect explicit project and row order while keeping status buckets', () => {
+  const tiles = layout.denseTiles([
+    group('zeta', { working: [s('w1', 1), s('w2', 2)] }),
+    group('alpha', { attention: [s('a1', 1)], working: [s('w3', 3)] })
+  ], true, (a, b) => b.startedAtMs - a.startedAtMs);
+  assert.deepEqual(tiles.map(t => t.displayName), ['zeta', 'alpha']);
+  assert.deepEqual(tiles.map(t => t.sessions.map(x => x.id)), [['w2', 'w1'], ['a1', 'w3']]);
+});
+
 test('tiles: inputs are not mutated', () => {
   const working = [s('b', 2), s('a', 1)];
   layout.denseTiles([group('p', { working })]);

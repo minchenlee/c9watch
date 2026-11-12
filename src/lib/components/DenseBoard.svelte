@@ -9,6 +9,8 @@
 
 	interface Props {
 		groups: ProjectGroupLike<Session>[];
+		useGroupOrder?: boolean;
+		compareSessions?: (a: Session, b: Session) => number;
 		/** One line per session. */
 		compact?: boolean;
 		/** Type size multiplier from the A−/A+ control. */
@@ -18,7 +20,10 @@
 		onopen: (session: Session) => void;
 	}
 
-	let { groups, compact = false, fontScale = 1, onexpand, onstop, onopen }: Props = $props();
+	let {
+		groups, useGroupOrder = false, compareSessions, compact = false, fontScale = 1,
+		onexpand, onstop, onopen
+	}: Props = $props();
 
 	const MIN_COLUMN = 300;
 	const GAP = 6;
@@ -28,7 +33,7 @@
 	const ROW_COMPACT = 25;
 
 	let width = $state(0);
-	let tiles = $derived(denseTiles(groups));
+	let tiles = $derived(denseTiles(groups, useGroupOrder, compareSessions));
 	// Bigger type needs wider columns, so fewer of them.
 	let columns = $derived(
 		packColumns(

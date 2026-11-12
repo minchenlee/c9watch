@@ -76,6 +76,8 @@
 
 	let viewMode = $state<'project' | 'all' | 'dense'>('project');
 	let isDense = $derived(viewMode === 'dense');
+	type MonitorSort = 'attention' | 'project' | 'last-active';
+	let sortMode = $state<MonitorSort>('attention');
 
 	let isCompact = $state(false);
 
@@ -113,6 +115,10 @@
 			const saved = localStorage.getItem('sessionViewMode');
 			if (saved === 'project' || saved === 'all' || saved === 'dense') {
 				viewMode = saved;
+			}
+			const savedSort = localStorage.getItem('monitorSort');
+			if (savedSort === 'project' || savedSort === 'last-active') {
+				sortMode = savedSort;
 			}
 			const savedCompact = localStorage.getItem('sessionViewCompact');
 			if (savedCompact === 'true') {
@@ -208,6 +214,12 @@
 	});
 
 	$effect(() => {
+		if (browser) {
+			localStorage.setItem('monitorSort', sortMode);
+		}
+	});
+
+	$effect(() => {
 		if (!browser) return;
 
 		const tabByKey: Record<string, typeof activeTab> = {
@@ -248,6 +260,19 @@
 		lastModified: number;
 	};
 
+	function projectName(path: string): string {
+		return path.split(/[/\\]/).filter(Boolean).pop() || path;
+	}
+
+	function byLastActive(a: Session, b: Session): number {
+		return (Date.parse(b.modified) || 0) - (Date.parse(a.modified) || 0);
+	}
+
+	function byProject(a: Session, b: Session): number {
+		return projectName(a.projectPath).localeCompare(projectName(b.projectPath)) ||
+			a.projectPath.localeCompare(b.projectPath);
+	}
+
 	// Helper function to group sessions by project path, then by status
 	function groupByProjectAndStatus(sessions: Session[]) {
 		const groups: ProjectGroup[] = [];
@@ -255,11 +280,9 @@
 		sessions.forEach(session => {
 			let group = groups.find(g => g.path === session.projectPath);
 			if (!group) {
-				const parts = session.projectPath.split(/[/\\]/);
-				const folderName = parts.filter(Boolean).pop() || session.projectPath;
 				group = {
 					path: session.projectPath,
-					displayName: folderName,
+					displayName: projectName(session.projectPath),
 					attention: [],
 					idle: [],
 					working: [],
@@ -270,6 +293,17 @@
 
 			addToGroup(group, session);
 		});
+
+		if (sortMode === 'last-active') {
+			for (const group of groups) {
+				for (const { id } of STATUS_BUCKETS) group[id].sort(byLastActive);
+			}
+			return groups.sort((a, b) => b.lastModified - a.lastModified);
+		}
+		if (sortMode === 'project') {
+			return groups.sort((a, b) => a.displayName.localeCompare(b.displayName) ||
+				a.path.localeCompare(b.path));
+		}
 
 		return sortGroups(groups);
 	}
@@ -282,7 +316,9 @@
 			if (bucket) groups[bucket].push(session);
 		});
 
-		const sortSessions = (a: Session, b: Session) => new Date(a.modified).getTime() - new Date(b.modified).getTime();
+		const oldestFirst = (a: Session, b: Session) => Date.parse(a.modified) - Date.parse(b.modified);
+		const sortSessions = sortMode === 'project' ? byProject :
+			sortMode === 'last-active' ? byLastActive : oldestFirst;
 
 		return STATUS_BUCKETS.map(({ id, label }) => ({
 			id,
@@ -649,6 +685,11 @@
 						</button>
 					{/if}
 					<div class="header-spacer"></div>
+					<select class="monitor-sort" aria-label="Sort sessions" bind:value={sortMode}>
+						<option value="attention">Attention first</option>
+						<option value="project">Project (A–Z)</option>
+						<option value="last-active">Last active</option>
+					</select>
 					<div class="view-toggle">
 						<button
 							class="toggle-btn"
@@ -767,6 +808,8 @@
 				{#if viewMode === 'dense'}
 					<DenseBoard
 						groups={projectGroups}
+						useGroupOrder={sortMode !== 'attention'}
+						compareSessions={sortMode === 'last-active' ? byLastActive : undefined}
 						compact={isCompact}
 						fontScale={denseFontScale}
 						onexpand={handleExpand}
@@ -1265,6 +1308,17 @@
 
 	.header-spacer {
 		flex: 1;
+	}
+
+	.monitor-sort {
+		min-height: 28px;
+		padding: 2px 4px;
+		border: 1px solid var(--border-default);
+		background: var(--bg-elevated);
+		color: var(--text-primary);
+		font: inherit;
+		font-size: 12px;
+		cursor: pointer;
 	}
 
 	.view-toggle {

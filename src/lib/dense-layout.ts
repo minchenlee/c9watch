@@ -35,27 +35,31 @@ function byStart<S extends SessionLike>(a: S, b: S): number {
 
 /**
  * One tile per project. Tiles move only when a project changes tier, never
- * because a session wrote to its transcript, so the board stays put while
+ * because a session wrote to its transcript by default, so the board stays put while
  * agents work and you can find a project where you last saw it.
  */
-export function denseTiles<S extends SessionLike>(groups: ProjectGroupLike<S>[]): DenseTile<S>[] {
-	return groups
-		.map((group) => ({
-			path: group.path,
-			displayName: group.displayName,
-			sessions: [
-				...[...group.attention].sort(byStart),
-				...[...group.idle].sort(byStart),
-				...[...group.working].sort(byStart)
-			],
-			tier: (group.attention.length > 0 ? 0 : group.idle.length > 0 ? 1 : 2) as 0 | 1 | 2
-		}))
-		.sort(
-			(a, b) =>
-				a.tier - b.tier ||
-				a.displayName.localeCompare(b.displayName) ||
-				a.path.localeCompare(b.path)
-		);
+export function denseTiles<S extends SessionLike>(
+	groups: ProjectGroupLike<S>[],
+	useGroupOrder = false,
+	compareSessions: (a: S, b: S) => number = byStart
+): DenseTile<S>[] {
+	const tiles = groups.map<DenseTile<S>>((group) => ({
+		path: group.path,
+		displayName: group.displayName,
+		sessions: [
+			...[...group.attention].sort(compareSessions),
+			...[...group.idle].sort(compareSessions),
+			...[...group.working].sort(compareSessions)
+		],
+		tier: group.attention.length > 0 ? 0 : group.idle.length > 0 ? 1 : 2
+	}));
+
+	return useGroupOrder ? tiles : tiles.sort(
+		(a, b) =>
+			a.tier - b.tier ||
+			a.displayName.localeCompare(b.displayName) ||
+			a.path.localeCompare(b.path)
+	);
 }
 
 /** How many columns at least `minWidth` wide fit in `width`, between 1 and `max`. */
