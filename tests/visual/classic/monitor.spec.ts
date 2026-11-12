@@ -13,11 +13,14 @@ test.describe('monitor tab', () => {
 		await openClassic(page, { monitorMetadata: true });
 		const codexCard = card(page, 'Init wizard copy review');
 		const duration = codexCard.getByTitle(/^Working since/);
+		const observed = card(page, 'Dashboard table perf').getByTitle(/^Observed working since/);
 
 		await expect(codexCard.getByTitle('gpt-6.1-sol · high')).toBeVisible();
 		await expect(duration).toHaveText('Working 1m 15s');
+		await expect(observed).toHaveText('Working 0s');
 		await page.clock.runFor(1000);
 		await expect(duration).toHaveText('Working 1m 16s');
+		await expect(observed).toHaveText('Working 1s');
 
 		await openTab(page, 'SETTINGS');
 		await page.getByRole('navigation', { name: 'Settings sections' })

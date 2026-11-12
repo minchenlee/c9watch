@@ -9,7 +9,7 @@
 
 <fieldset>
 	<legend>Monitor card details</legend>
-	<p>Working duration is available for Codex sessions with a recorded turn start.</p>
+	<p>Working duration uses the reported turn start when available, or the time since Monitor first saw the session working.</p>
 	{#each monitorCardFieldKeys as field (field)}
 		<label>
 			<span>{monitorCardFields[field]}</span>

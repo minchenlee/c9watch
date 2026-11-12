@@ -222,8 +222,8 @@
 						model={$monitorCardPreferences.model ? session.model : null}
 						reasoningEffort={$monitorCardPreferences.reasoningEffort ? session.reasoningEffort : null}
 					/>
-					{#if $monitorCardPreferences.workingDuration && session.status === SessionStatus.Working && session.turnStartedAtMs != null}
-						<WorkingDuration startedAt={session.turnStartedAtMs} {compact} />
+					{#if $monitorCardPreferences.workingDuration && session.status === SessionStatus.Working}
+						<WorkingDuration sessionKey={sessionKeyOf(session)} turnStartedAt={session.turnStartedAtMs} {compact} />
 					{/if}
 					<span class="session-name-badge">{session.sessionName}</span>
 				{#if isBackground}

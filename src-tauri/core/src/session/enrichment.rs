@@ -418,6 +418,8 @@ pub fn enrich_detected_sessions(
                     .map(|prompt| truncate_string(prompt, 100))
                     .filter(|prompt| !prompt.trim().is_empty())
                     .unwrap_or_else(|| "(No conversation yet)".to_string()),
+                model: summary.model.clone(),
+                reasoning_effort: summary.reasoning_effort.clone(),
                 message_count: summary.message_count as u32,
                 modified: modified_or_started(&summary.last_timestamp, detected.started_at_ms),
                 status: transcript_status(working, summary.empty),

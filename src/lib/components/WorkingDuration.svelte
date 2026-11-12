@@ -1,7 +1,11 @@
 <script lang="ts">
-	import { monitorClock } from '$lib/stores/monitor-clock';
+	import { monitorClock, observedWorkingSince } from '$lib/stores/monitor-clock';
 
-	let { startedAt, compact = false }: { startedAt: number; compact?: boolean } = $props();
+	let {
+		sessionKey, turnStartedAt, compact = false
+	}: { sessionKey: string; turnStartedAt?: number | null; compact?: boolean } = $props();
+	let startedAt = $derived(turnStartedAt ?? $observedWorkingSince.get(sessionKey) ?? $monitorClock);
+	let sinceLabel = $derived(turnStartedAt == null ? 'Observed working since' : 'Working since');
 	let seconds = $derived(Math.max(0, Math.floor(($monitorClock - startedAt) / 1000)));
 	let minutes = $derived(Math.floor(seconds / 60));
 	let elapsed = $derived(
@@ -10,7 +14,7 @@
 	);
 </script>
 
-<span title={`Working since ${new Date(startedAt).toLocaleString()}`}>
+<span title={`${sinceLabel} ${new Date(startedAt).toLocaleString()}`}>
 	{compact ? elapsed : `Working ${elapsed}`}
 </span>
 
