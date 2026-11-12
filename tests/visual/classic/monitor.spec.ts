@@ -1,5 +1,5 @@
-import { test, type Page } from '@playwright/test';
-import { openClassic, settle, snap } from '../harness/classic';
+import { expect, test, type Page } from '@playwright/test';
+import { openClassic, openTab, settle, snap } from '../harness/classic';
 
 const card = (page: Page, title: string) => page.locator('.session-card', { hasText: title });
 
@@ -7,6 +7,37 @@ test.describe('monitor tab', () => {
 	test('grouped by project', async ({ page }) => {
 		await openClassic(page);
 		await snap(page, 'monitor-project');
+	});
+
+	test('updates the active turn timer and hides card fields independently', async ({ page }) => {
+		await openClassic(page, { monitorMetadata: true });
+		const codexCard = card(page, 'Init wizard copy review');
+		const duration = codexCard.getByTitle(/^Working since/);
+		const observed = card(page, 'Dashboard table perf').getByTitle(/^Observed working since/);
+
+		await expect(codexCard.getByTitle('gpt-6.1-sol · high')).toBeVisible();
+		await expect(duration).toHaveText('Working 1m 15s');
+		await expect(observed).toHaveText('Working 0s');
+		await page.clock.runFor(1000);
+		await expect(duration).toHaveText('Working 1m 16s');
+		await expect(observed).toHaveText('Working 1s');
+
+		await openTab(page, 'SETTINGS');
+		await page.getByRole('navigation', { name: 'Settings sections' })
+			.getByRole('button', { name: 'Monitor', exact: true }).click();
+		await page.getByRole('checkbox', { name: 'Model', exact: true }).uncheck();
+		const timerToggle = page.getByRole('checkbox', { name: 'Working duration' });
+		await timerToggle.uncheck();
+		await timerToggle.blur();
+		await openTab(page, 'MONITOR');
+
+		await expect(codexCard.getByTitle('high', { exact: true })).toBeVisible();
+		await expect(codexCard.getByText('gpt-6.1-sol')).toHaveCount(0);
+		await expect(duration).toHaveCount(0);
+		const saved = await page.evaluate(() =>
+			JSON.parse(localStorage.getItem('c9watch.monitorCardPreferences.v1') ?? '{}')
+		);
+		expect(saved).toMatchObject({ model: false, reasoningEffort: true, workingDuration: false });
 	});
 
 	test('grouped by project, tall window shows every card', async ({ page }) => {

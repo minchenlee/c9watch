@@ -1274,6 +1274,8 @@ export interface C9pSessionView {
   lastAssistantMessage?: string | null;
   latestMessage: string;
   messageCount: number;
+  /** Last reported model for this session. */
+  model?: string | null;
   modified: string;
   /**
    * User-set name from `claude agents` (Ctrl+T background-pinned sessions).
@@ -1289,6 +1291,8 @@ export interface C9pSessionView {
   pid: number;
   projectPath: string;
   provider: C9pSessionProvider;
+  /** Reasoning effort recorded for the current or most recent turn. */
+  reasoningEffort?: string | null;
   rootSessionId?: string | null;
   /** Provider-scoped identity used by frontend selection and backend maps. */
   sessionKey: string;
@@ -1308,6 +1312,8 @@ export interface C9pSessionView {
    * type. The lead's own view has none; its teammates name it.
    */
   teammate?: C9pTeammateLink | null;
+  /** Start of the current turn in milliseconds since the Unix epoch, when reported. */
+  turnStartedAtMs?: number | null;
   /** What the session needs from the user (tool name only, never arguments). */
   waitingFor?: C9pWaitingFor | null;
   /**
