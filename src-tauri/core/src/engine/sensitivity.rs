@@ -113,6 +113,7 @@ const BY_NAME: &[(&str, &str)] = &[
     ("createdAt", P),
     ("startedAt", P),
     ("startedAtMs", P),
+    ("turnStartedAtMs", P),
     ("completedAt", P),
     ("goneAt", P),
     ("lastSeen", P),

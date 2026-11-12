@@ -8,6 +8,8 @@
 	import { awayActivityLabel, awayActivityShortLabel } from '$lib/session-utils';
 	import { getSessionStatusShortLabel } from '$lib/status-utils';
 	import SessionModelLabel from './SessionModelLabel.svelte';
+	import WorkingDuration from './WorkingDuration.svelte';
+	import { monitorCardPreferences } from '$lib/stores/monitor-card-preferences';
 	import { formatTimeSince } from '$lib/time-utils';
 	import {
 		canSessionAction,
@@ -126,24 +128,34 @@
 		<div class="line">
 			<span class="chip">{statusWord}</span>
 			<span class="title" title={`${title}\n${session.id}`}>{title}</span>
-			{#if session.gitBranch}
+			{#if $monitorCardPreferences.gitBranch && session.gitBranch}
 				<span class="branch" title={`Branch: ${session.gitBranch}`}>{session.gitBranch}</span>
 			{/if}
-			<SessionModelLabel model={session.model} reasoningEffort={session.reasoningEffort} />
+			<SessionModelLabel
+				model={$monitorCardPreferences.model ? session.model : null}
+				reasoningEffort={$monitorCardPreferences.reasoningEffort ? session.reasoningEffort : null}
+			/>
+			{#if $monitorCardPreferences.workingDuration && session.status === SessionStatus.Working && session.turnStartedAtMs != null}
+				<WorkingDuration startedAt={session.turnStartedAtMs} compact />
+			{/if}
 			<span class="meta">
 				{#if health}
 					<span class="health" title={health.title}>{health.label}</span>
 				{/if}
 				<span class="prov" title={providerLabel(provider)}>{providerShortLabel(provider)}</span>
-				<span class="num msgs" title={`${session.messageCount} messages`}>
-					<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
-						<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-					</svg>{session.messageCount}
-				</span>
-				{#if costLabel}
+				{#if $monitorCardPreferences.messageCount}
+					<span class="num msgs" title={`${session.messageCount} messages`}>
+						<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+							<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+						</svg>{session.messageCount}
+					</span>
+				{/if}
+				{#if $monitorCardPreferences.cost && costLabel}
 					<span class="num cost" title={$costMode === 'usd' ? 'Session cost' : 'Session tokens'}>{costLabel}</span>
 				{/if}
-				<span class="num age" title={`Started ${new Date(startedAtIso).toLocaleString()}`}>{formatTimeSince(startedAtIso)}</span>
+				{#if $monitorCardPreferences.sessionAge}
+					<span class="num age" title={`Started ${new Date(startedAtIso).toLocaleString()}`}>{formatTimeSince(startedAtIso)}</span>
+				{/if}
 			</span>
 		</div>
 

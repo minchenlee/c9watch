@@ -1399,6 +1399,8 @@ export interface C9pSessionView {
    * type. The lead's own view has none; its teammates name it.
    */
   teammate?: C9pTeammateLink | null;
+  /** Start of the current turn in milliseconds since the Unix epoch, when reported. */
+  turnStartedAtMs?: number | null;
   /** What the session needs from the user (tool name only, never arguments). */
   waitingFor?: C9pWaitingFor | null;
   /**

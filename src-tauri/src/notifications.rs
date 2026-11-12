@@ -455,6 +455,7 @@ pub(crate) mod tests {
             ai_title: None,
             model: None,
             reasoning_effort: None,
+            turn_started_at_ms: None,
             project_path: "/tmp/project".to_string(),
             git_branch: None,
             first_prompt: "investigate".to_string(),

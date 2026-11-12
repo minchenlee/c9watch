@@ -54,6 +54,8 @@ pub struct Session {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_started_at_ms: Option<i64>,
     pub first_prompt: String,
     pub summary: Option<String>,
     pub message_count: u32,
@@ -315,6 +317,7 @@ pub fn enrich_detected_sessions(
                 codex_title: crate::session::codex::get_cached_codex_thread_title(&session_id),
                 model: summary.model.clone(),
                 reasoning_effort: summary.reasoning_effort.clone(),
+                turn_started_at_ms: summary.turn_started_at_ms,
                 first_prompt: summary
                     .first_prompt()
                     .map(|prompt| truncate_string(prompt, 100))
@@ -672,6 +675,7 @@ pub fn enrich_detected_sessions(
             ai_title: native_titles.ai,
             model,
             reasoning_effort: None,
+            turn_started_at_ms: None,
             project_path: detected.cwd.to_string_lossy().to_string(),
             git_branch,
             first_prompt,
@@ -729,6 +733,7 @@ fn base_session(detected: &DetectedSession, session_id: &str) -> Session {
         ai_title: None,
         model: None,
         reasoning_effort: None,
+        turn_started_at_ms: None,
         project_path: detected.cwd.to_string_lossy().to_string(),
         git_branch: None,
         first_prompt: String::new(),
@@ -1224,6 +1229,7 @@ impl Session {
             ai_title: None,
             model: None,
             reasoning_effort: None,
+            turn_started_at_ms: None,
             project_path: "/tmp/project".to_string(),
             git_branch: None,
             first_prompt: "investigate".to_string(),

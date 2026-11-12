@@ -44,6 +44,9 @@ pub struct SessionView {
     /// Reasoning effort recorded for the current or most recent turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Start of the current turn in milliseconds since the Unix epoch, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_started_at_ms: Option<i64>,
     pub first_prompt: String,
     pub summary: Option<String>,
     pub message_count: u32,
@@ -126,6 +129,7 @@ impl From<&Session> for SessionView {
             git_branch: s.git_branch.clone(),
             model: s.model.clone(),
             reasoning_effort: s.reasoning_effort.clone(),
+            turn_started_at_ms: s.turn_started_at_ms,
             first_prompt: s.first_prompt.clone(),
             summary: s.summary.clone(),
             message_count: s.message_count,
@@ -179,6 +183,7 @@ mod tests {
         s.git_branch = Some("main".into());
         s.model = Some("gpt-6.1-sol".into());
         s.reasoning_effort = Some("high".into());
+        s.turn_started_at_ms = Some(1_752_364_801_000);
         s.summary = Some("summary".into());
         s.source_health = Some(SourceHealth::Stale);
         s.latest_message = "latest".into();

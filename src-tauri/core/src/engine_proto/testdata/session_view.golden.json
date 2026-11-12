@@ -71,6 +71,7 @@
       "leadSessionId": "lead",
       "teamName": "session-lead"
     },
+    "turnStartedAtMs": 1752364801000,
     "waitingFor": {
       "kind": "approval",
       "tool": "Bash"

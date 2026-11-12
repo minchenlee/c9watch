@@ -130,6 +130,7 @@ pub struct CodexRolloutSummary {
     pub last_timestamp: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub turn_started_at_ms: Option<i64>,
     /// `session_meta.originator` (`codex-tui`, `codex_exec`, `Codex Desktop`…).
     pub originator: String,
     /// `session_meta.source` when it is a plain string (`cli`, `vscode`…).
@@ -1777,8 +1778,14 @@ fn apply_event_message(
         return;
     }
     match payload.get("type").and_then(Value::as_str) {
-        Some("task_started") => summary.lifecycle = CodexLifecycle::Working,
-        Some("task_complete") | Some("turn_aborted") => summary.lifecycle = CodexLifecycle::Idle,
+        Some("task_started") => {
+            summary.lifecycle = CodexLifecycle::Working;
+            summary.turn_started_at_ms = parse_timestamp_millis(timestamp);
+        }
+        Some("task_complete" | "turn_aborted") => {
+            summary.lifecycle = CodexLifecycle::Idle;
+            summary.turn_started_at_ms = None;
+        }
         Some("thread_rolled_back") => {
             let turns = payload
                 .get("num_turns")
@@ -1786,6 +1793,7 @@ fn apply_event_message(
                 .unwrap_or(1) as usize;
             rollback_messages(&mut summary.messages, turns);
             summary.lifecycle = CodexLifecycle::Idle;
+            summary.turn_started_at_ms = None;
         }
         _ => {}
     }
@@ -2260,6 +2268,34 @@ mod tests {
         let summary = source.summary_for(&path).unwrap();
         assert_eq!(summary.model.as_deref(), Some("gpt-6.1-luna"));
         assert_eq!(summary.reasoning_effort, None);
+    }
+
+    #[test]
+    fn monitor_tracks_the_start_of_each_active_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout.jsonl");
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let first = "2026-07-13T00:00:00Z";
+        let second = "2026-07-13T00:02:00Z";
+        let mut file = fs::File::create(&path).unwrap();
+
+        for (timestamp, kind, expected) in [
+            (first, "task_started", parse_timestamp_millis(first)),
+            (
+                "2026-07-13T00:00:30Z",
+                "token_count",
+                parse_timestamp_millis(first),
+            ),
+            ("2026-07-13T00:01:00Z", "task_complete", None),
+            (second, "task_started", parse_timestamp_millis(second)),
+            ("2026-07-13T00:03:00Z", "turn_aborted", None),
+        ] {
+            use std::io::Write as _;
+            let line = event(timestamp, "event_msg", serde_json::json!({"type": kind}));
+            writeln!(file, "{line}").unwrap();
+            let summary = source.summary_for(&path).unwrap();
+            assert_eq!(summary.turn_started_at_ms, expected, "{kind}");
+        }
     }
 
     fn root_fixture(source: Value, originator: &str) -> Vec<String> {

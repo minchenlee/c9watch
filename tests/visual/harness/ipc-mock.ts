@@ -14,6 +14,8 @@ export interface VisualOptions {
 	window?: 'main' | 'popover';
 	/** `full` answers every fixture; `empty` has no live sessions. */
 	sessions?: 'full' | 'empty';
+	/** Include model, effort, and an active turn start for the working Codex fixture. */
+	monitorMetadata?: boolean;
 	/** When set, `stop_session` rejects with this message. */
 	stopError?: string | null;
 }
@@ -27,13 +29,20 @@ declare global {
 }
 
 const options: VisualOptions = window.__C9_VISUAL__ ?? {};
+const live = options.sessions === 'empty' ? [] : fx.sessions.map((session) =>
+	options.monitorMetadata && session.id === 'codex-thread-0007' ? {
+		...session,
+		model: 'gpt-6.1-sol',
+		reasoningEffort: 'high',
+		turnStartedAtMs: fx.FIXED_NOW - 75_000
+	} : session
+);
 const unhandled: string[] = [];
 window.__C9_VISUAL_UNHANDLED__ = unhandled;
 
 type Args = Record<string, unknown> | undefined;
 
 function handle(cmd: string, args: Args): unknown {
-	const live = options.sessions === 'empty' ? [] : fx.sessions;
 	switch (cmd) {
         case 'c9p_request': {
             const p = (args?.params ?? {}) as Record<string, any>;
