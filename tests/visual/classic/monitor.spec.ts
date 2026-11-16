@@ -14,7 +14,7 @@ test.describe('monitor tab', () => {
 		const sort = page.getByRole('combobox', { name: 'Sort sessions' });
 		const projects = page.locator('.project-section .project-name');
 
-		await expect(projects).toHaveText(['web-app', 'api-server', 'cli-tools']);
+		await expect(projects).toHaveText(['api-server', 'web-app', 'cli-tools']);
 		await sort.selectOption('project');
 		await expect(projects).toHaveText(['api-server', 'cli-tools', 'web-app']);
 		await sort.selectOption('last-active');
