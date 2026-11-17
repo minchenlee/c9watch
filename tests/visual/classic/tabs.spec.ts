@@ -1,4 +1,4 @@
-import { test } from '@playwright/test';
+import { expect, test } from '@playwright/test';
 import { openClassic, openTab, settle, snap } from '../harness/classic';
 
 test.describe('history tab', () => {
@@ -92,4 +92,26 @@ test.describe('settings tab', () => {
 			await snap(page, `settings-${section.toLowerCase().replace(/\s+/g, '-')}`);
 		});
 	}
+});
+
+// D43: Glass is not shipped. This suite runs the plain `vite build`, the
+// same build a release uses, so Glass must be off here.
+test.describe('glass is off in a release build', () => {
+	test('a stored ui.shell = glass still opens Classic and is left as it is', async ({ page }) => {
+		await openClassic(page, { storage: { 'ui.shell': 'glass' } });
+		await expect(page.locator('.glass-root')).toHaveCount(0);
+		await openTab(page, 'SETTINGS');
+		expect(await page.evaluate(() => localStorage.getItem('ui.shell'))).toBe('glass');
+	});
+
+	test('Classic SETTINGS has no switch to Glass and no word about it', async ({ page }) => {
+		await openClassic(page);
+		await openTab(page, 'SETTINGS');
+		for (const section of ['Notifications', 'Usage', 'Integration', 'Remote access', 'About']) {
+			await page.locator('.settings-nav button', { hasText: section }).click();
+			await settle(page);
+			await expect(page.locator('[data-shell-switch]')).toHaveCount(0);
+			await expect(page.getByText(/glass/i)).toHaveCount(0);
+		}
+	});
 });
