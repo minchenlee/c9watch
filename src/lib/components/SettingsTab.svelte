@@ -7,7 +7,7 @@
 	import { renderPlainMarkdown } from '$lib/markdown';
 	import { openUrl } from '$lib/data/platform';
 	import { isTauri } from '$lib/ws';
-	import { shell } from '$lib/data/stores/settings';
+	import { shell, glassAvailable } from '$lib/data/stores/settings';
 	import {
 		currentVersion,
 		updateAvailable,
@@ -181,11 +181,12 @@
 			</div>
 		</div>
 
+		{#if glassAvailable}
 		<div class="group" data-shell-switch>
 			<div class="group-title group-title--lg">Interface</div>
 			<div class="group-body">
 				<div class="status-line">
-					<span class="status-text status-text--dim">Classic. Glass is the new interface (preview).</span>
+					<span class="status-text status-text--dim">Classic. Glass is a development build only.</span>
 					{#if !confirmGlass}
 						<button class="btn-ghost" onclick={() => (confirmGlass = true)} data-shell="glass">Switch to Glass</button>
 					{/if}
@@ -199,6 +200,7 @@
 				{/if}
 			</div>
 		</div>
+		{/if}
 
 		{#if update}
 			<div class="group" >
