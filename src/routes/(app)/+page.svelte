@@ -1310,15 +1310,33 @@
 		flex: 1;
 	}
 
+	/* Same box as .view-toggle: square, 34px high, muted mono label. The
+	   native look is off, so the arrow is drawn here. */
 	.monitor-sort {
-		min-height: 28px;
-		padding: 2px 4px;
+		appearance: none;
+		-webkit-appearance: none;
+		height: 34px;
+		margin: 0;
+		padding: 0 26px 0 var(--space-sm);
 		border: 1px solid var(--border-default);
-		background: var(--bg-elevated);
-		color: var(--text-primary);
-		font: inherit;
-		font-size: 12px;
+		border-radius: 0;
+		background: rgba(255, 255, 255, 0.03)
+			url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")
+			no-repeat right 8px center;
+		color: var(--text-muted);
+		font-family: var(--font-mono);
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
 		cursor: pointer;
+		transition: all 0.2s ease;
+	}
+
+	.monitor-sort:hover,
+	.monitor-sort:focus-visible {
+		color: var(--text-primary);
+		border-color: var(--text-muted);
+		outline: none;
 	}
 
 	.view-toggle {
@@ -1546,6 +1564,25 @@
 		.view-toggle {
 			padding: 1px;
 		}
+
+		/* Narrow: the arrow only, so the header stays on one line. The
+		   label is still the accessible name and the menu still has text. */
+		.monitor-sort {
+			width: 28px;
+			height: 36px;
+			padding: 0;
+			color: transparent;
+			background-position: center;
+		}
+
+		.monitor-sort:hover,
+		.monitor-sort:focus-visible {
+			color: transparent;
+		}
+
+		/* The short attention label makes room for the sort control. */
+		.system-section .attention-label { display: none; }
+		.system-section .attention-label-short { display: inline; }
 
 		.toggle-btn {
 			width: 32px;
