@@ -300,28 +300,6 @@ test('threads: one per agent, agent mail in both threads, attention and labels',
     assert.equal(mail.agentIdOf('m1/agt_a'), 'agt_a');
 });
 
-test('demo mailbox drives the same feed: list, send walks states, cancel only queued', async () => {
-    const demo = load('../src/lib/data/demo/mail.ts');
-    const mail = store(); const seen = [];
-    const transport = { async request(m, p) { return demo.demoMailRequest(m, p); }, async subscribe(_p, cb) { return demo.demoMailSubscribe(data => cb(event(data))); } };
-    const feed = mail.mailFeed(transport, s => seen.push(s));
-    await settle();
-    const snap = seen.at(-1);
-    assert.equal(snap.status, 'ready');
-    assert.equal(snap.sessionKeys.get('agt_demo_pm'), 'claudeCode:demo-1');
-    const states = new Set([...snap.messages.values()].map(m => mail.stateLabel(m)));
-    for (const s of ['QUEUED', 'HELD', 'UNCERTAIN', 'FAILED', '✓ DELIVERED']) assert(states.has(s), s);
-    const sent = demo.demoMailRequest('msg.send', { to: 'reviewer', body: 'hello' });
-    assert.equal(seen.at(-1).messages.get(sent.msgId).state, 'queued', 'the queued event alone makes the row');
-    for (const t of demo.timers.splice(0)) t.fn();
-    assert.equal(seen.at(-1).messages.get(sent.msgId).state, 'delivered');
-    assert.throws(() => demo.demoMailRequest('msg.cancel', { msgId: sent.msgId }), e => e.code === 'not_cancellable');
-    demo.demoMailRequest('msg.cancel', { msgId: 'msg_demo_08' });
-    assert.equal(seen.at(-1).messages.get('msg_demo_08').state, 'cancelled');
-    assert.equal(demo.demoMailRequest('msg.read', { msgId: 'msg_demo_01' }).body.startsWith('Plan the OAuth2'), true);
-    feed.stop();
-});
-
 test('agent.list mailPaused seeds the pause state; an older engine sends none', async () => {
     const mail = store(); const seen = []; let clock = 100;
     const transport = {
@@ -351,14 +329,4 @@ test('agent.list mailPaused seeds the pause state; an older engine sends none', 
     assert.deepEqual([...old.paused], ['agt_b'], 'local change before the list: the list wins');
     assert.equal(mail.seedPause({ ...snap, agentPause: new Map() }, new Set(), new Set(), new Map()), null);
     feed.stop();
-});
-
-test('demo agent.list reports mail pause and resume', () => {
-    const demo = load('../src/lib/data/demo/mail.ts');
-    const pausedOf = id => demo.demoMailRequest('agent.list', {}).agents.find(a => a.id === id).mailPaused;
-    assert.equal(pausedOf('agt_demo_api'), false);
-    demo.demoMailRequest('mail.pause', { agent: 'worker-api' });
-    assert.equal(pausedOf('agt_demo_api'), true);
-    demo.demoMailRequest('mail.resume', { agent: 'agt_demo_api' });
-    assert.equal(pausedOf('agt_demo_api'), false);
 });

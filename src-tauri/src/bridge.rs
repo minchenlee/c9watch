@@ -6,7 +6,7 @@ use crate::engine_proto::{
         core_action, core_usable, CoreAction, GUI_AGENT_METHODS, GUI_MAIL_METHODS, GUI_METHODS,
     },
     home::{engine_home, sock_path},
-    spawn::{ensure_engine, restart_engine, ConnectError, EngineConn, Frames},
+    spawn::{ConnectError, EngineConn, Frames},
     wire::{AgentListResult, EventFrame, NotificationEvent, SubscribeParams},
 };
 use serde::Serialize;
@@ -600,11 +600,6 @@ pub fn start(app: AppHandle, bridge: Arc<Bridge>, server: Arc<crate::web_server:
             bind_gui(&server);
             return;
         }
-        let Ok(exe) = std::env::current_exe() else {
-            bind_gui(&server);
-            return;
-        };
-        let mut restarted = false;
         let mut bound = false;
         let mut recovering = None;
         let mut snapshot: Vec<Value> = Vec::new();
@@ -612,14 +607,8 @@ pub fn start(app: AppHandle, bridge: Arc<Bridge>, server: Arc<crate::web_server:
         loop {
             let mut wait_agents = false;
             let attempt = (|| -> Result<(), String> {
-                // A GUI-only dev binary has no engine CLI dispatch. Spawning
-                // it with `engine` would launch another GUI, so it may only
-                // connect to an existing core and otherwise uses fallback.
-                let hello = if cfg!(feature = "engine") {
-                    ensure_engine(&home, &exe)?
-                } else {
-                    connect(&home)?.hello
-                };
+                // Connect to an existing core; otherwise use the fallback.
+                let hello = connect(&home)?.hello;
                 let mut conn = connect(&home)?;
                 let controlled = if core_usable(&hello) {
                     None
@@ -628,16 +617,6 @@ pub fn start(app: AppHandle, bridge: Arc<Bridge>, server: Arc<crate::web_server:
                 };
                 match core_action(&hello, env!("CARGO_PKG_VERSION"), controlled) {
                     CoreAction::Use => {}
-                    CoreAction::Restart if !restarted && cfg!(feature = "engine") => {
-                        bridge.fall_back();
-                        restarted = true;
-                        restart_engine(&home, &exe)?;
-                        conn = connect(&home)?;
-                        if !core_usable(&conn.hello) {
-                            return Err("Core still incompatible after restart".into());
-                        }
-                        cursor = None;
-                    }
                     _ => {
                         bridge.fall_back();
                         wait_agents = controlled == Some(true);
@@ -945,72 +924,6 @@ mod tests {
         assert!(allowed("session.views", true));
         assert!(allowed("annotation.list", false));
         assert!(allowed("annotation.list", true));
-    }
-    #[cfg(feature = "engine")]
-    #[test]
-    fn webview_allowlist_is_a_subset_of_central_authority() {
-        use crate::engine::{authz, principal::Principal};
-        for method in GUI_METHODS
-            .iter()
-            .chain(GUI_MAIL_METHODS)
-            .chain(GUI_AGENT_METHODS)
-        {
-            assert!(
-                authz::can(method, &Principal::LocalUnverified, None).allowed,
-                "{method}"
-            );
-            assert!(gui_authorized("methods", method), "{method}");
-        }
-        for method in crate::engine::discovery::methods().keys() {
-            if allowed(method, false) {
-                assert!(
-                    authz::can(method, &Principal::LocalUnverified, None).allowed,
-                    "{method}"
-                );
-            }
-            // The popover never gets a mail method or a write path.
-            if method.starts_with("msg.") || method.starts_with("mail.") {
-                assert!(!allowed(method, true), "{method}");
-                assert_eq!(
-                    allowed(method, false),
-                    GUI_MAIL_METHODS.contains(&method.as_str()),
-                    "{method}"
-                );
-            }
-            if method.starts_with("gateway.")
-                || method.starts_with("hook.")
-                || matches!(
-                    method.as_str(),
-                    "agent.create" | "agent.resume" | "gui.confirmer.attach"
-                )
-            {
-                assert!(!allowed(method, false), "{method}");
-            }
-            // D42: of the agent.* methods, the main window gets agent.list
-            // and agent.retire only; the popover gets agent.list only.
-            if method.starts_with("agent.") {
-                assert_eq!(
-                    allowed(method, false),
-                    matches!(method.as_str(), "agent.list" | "agent.retire"),
-                    "{method}"
-                );
-                assert_eq!(allowed(method, true), method == "agent.list", "{method}");
-            }
-        }
-        assert!(authz::topics(&Principal::LocalUnverified, None)
-            .iter()
-            .any(|t| t == "msg.state"));
-        for topic in ["annotation.changed", "annotation.removed"] {
-            assert!(authz::topics(&Principal::LocalUnverified, None)
-                .iter()
-                .any(|t| t == topic));
-            let params = SubscribeParams {
-                topics: vec![topic.into()],
-                ..Default::default()
-            };
-            assert!(allowed_topics(&params, false));
-            assert!(allowed_topics(&params, true));
-        }
     }
     #[test]
     fn popover_topics_are_read_only_and_no_wildcard_escape() {

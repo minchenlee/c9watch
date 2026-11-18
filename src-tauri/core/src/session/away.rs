@@ -27,7 +27,6 @@ pub const LAST_ASSISTANT_MESSAGE_MAX_CHARS: usize = 140;
 /// What a session needs from the user. Tool arguments are never included:
 /// only the tool *name* leaves the backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum WaitingFor {
     Approval { tool: String },
@@ -65,7 +64,6 @@ pub fn last_assistant_line(text: Option<&str>) -> Option<String> {
 
 /// Counts of what happened after `since_ms`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AwayActivity {
     pub since_ms: i64,
@@ -79,7 +77,6 @@ pub struct AwayActivity {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AwayRequest {
     pub session_key: String,

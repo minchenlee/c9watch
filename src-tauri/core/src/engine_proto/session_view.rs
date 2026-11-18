@@ -18,7 +18,6 @@ use serde::Serialize;
 
 /// Combined session information
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionView {
     pub id: String,
@@ -258,51 +257,6 @@ mod tests {
         let view = wire(&full());
         for name in INTERNAL_ONLY {
             assert!(view.get(*name).is_none(), "{name} leaked into SessionView");
-        }
-    }
-
-    /// The internal `Session` has no JSON Schema, so the published schema
-    /// cannot be generated from it. This fails to compile if `Session`
-    /// derives `JsonSchema` again.
-    #[cfg(feature = "engine")]
-    #[allow(dead_code)]
-    const _: fn() = || {
-        trait NoSchema<A> {
-            fn check() {}
-        }
-        impl<T: ?Sized> NoSchema<()> for T {}
-        struct HasSchema;
-        impl<T: ?Sized + schemars::JsonSchema> NoSchema<HasSchema> for T {}
-        // Ambiguous, and so a compile error, when `Session: JsonSchema`.
-        <Session as NoSchema<_>>::check();
-    };
-
-    /// The schema's `SessionView` is the DTO: its properties are exactly
-    /// the fields a fully set view sends, no internal-only field appears
-    /// anywhere in the schema, and there is no `Session` definition.
-    #[cfg(feature = "engine")]
-    #[test]
-    fn schema_session_view_is_the_dto() {
-        let schema = crate::engine::api::schema();
-        let defs = schema["$defs"].as_object().unwrap();
-        assert!(!defs.contains_key("Session"));
-        let props: std::collections::BTreeSet<&str> = defs["SessionView"]["properties"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        let view = wire(&full());
-        let sent: std::collections::BTreeSet<&str> = view
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(props, sent);
-        let text = schema.to_string();
-        for name in INTERNAL_ONLY {
-            assert!(!text.contains(name), "{name} leaked into the schema");
         }
     }
 }

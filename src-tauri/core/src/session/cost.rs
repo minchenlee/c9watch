@@ -303,7 +303,6 @@ fn parse_line(line: &str) -> Option<ParsedLine> {
 }
 
 /// A single session's cost record (stored in cache).
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionCostRecord {
@@ -341,7 +340,6 @@ fn default_provider() -> String {
 }
 
 /// Aggregated cost data returned to the frontend.
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CostData {
@@ -354,7 +352,6 @@ pub struct CostData {
     pub model_costs: Vec<ModelCost>,
 }
 
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyCost {
@@ -363,7 +360,6 @@ pub struct DailyCost {
     pub sessions: Vec<SessionCostRecord>,
 }
 
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectCost {
@@ -373,7 +369,6 @@ pub struct ProjectCost {
     pub sessions: Vec<SessionCostRecord>,
 }
 
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCost {

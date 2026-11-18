@@ -8,16 +8,13 @@
 pub use c9watch_core::{actions, claude_hooks, claude_path, claude_usage, debug_log, log_line};
 pub use c9watch_core::{session, write_native_custom_title};
 
-#[cfg(any(feature = "gui", all(unix, feature = "engine")))]
+#[cfg(feature = "gui")]
 pub use c9watch_core::gateway;
 
 #[cfg(feature = "cli")]
 pub use c9watch_core::cli;
 
-#[cfg(feature = "engine")]
-pub use c9watch_core::engine;
-
-#[cfg(all(unix, any(feature = "gui", feature = "engine")))]
+#[cfg(all(unix, feature = "gui"))]
 pub use c9watch_core::engine_proto;
 
 // ── GUI-only modules ────────────────────────────────────────────────

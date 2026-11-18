@@ -2,15 +2,7 @@ import type { C9pMethod } from '../c9p-1';
 import type { Transport } from './transport';
 import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations, getDemoAwayActivity, getDemoDiagnostics } from '../demo/data';
 import { demoSubscriptionUsage } from '../subscription-usage';
-import { demoMailRequest, demoMailSubscribe } from './demo/mail';
 import { glassDemoAgents, glassDemoAnnotations, glassDemoAway, glassDemoCost, glassDemoHistory, glassDemoMemory, glassDemoSessionViews } from './demo/glass';
-/** Demo mail is opt-in (`localStorage['c9watch.demoMail'] = '1'`). Without
- * it, demo answers mail like today's Classic bridge, so demo screens do not
- * change until the bridge exposes mail. */
-const DEMO_MAIL_KEY = 'c9watch.demoMail';
-function demoMailOn(): boolean {
-    try { return globalThis.localStorage?.getItem(DEMO_MAIL_KEY) === '1'; } catch { return false; }
-}
 /** The glass fixture is opt-in (`localStorage['c9watch.demoGlass'] = '1'`).
  * Without it, every answer below stays as it is, so Classic demo baselines
  * do not change. */
@@ -49,7 +41,6 @@ function demoGlassRequest(method: C9pMethod, p: any): any {
         default: return undefined;
     }
 }
-const mailDenied = () => Object.assign(new Error('Mail is not exposed in demo mode'), { code: 'not_allowed', msg: 'Mail is not exposed in demo mode' });
 export const demoTransport: Transport = {
     async request(method: C9pMethod, p: any): Promise<any> {
         const glass = glassShellActive && demoGlassOn() ? demoGlassRequest(method, p) : undefined;
@@ -71,16 +62,13 @@ export const demoTransport: Transport = {
             case 'session.tasks': return { tasks: [] };
             case 'msg.list': case 'msg.read': case 'msg.cancel': case 'msg.send':
             case 'mail.pause': case 'mail.resume':
-                if (!demoMailOn()) throw mailDenied();
-                return demoMailRequest(method, p);
-            case 'agent.list': return demoMailOn() ? demoMailRequest(method, p) : { agents: [] };
+                throw Object.assign(new Error('Mail is not available'), { code: 'not_allowed', msg: 'Mail is not available' });
+            case 'agent.list': return { agents: [] };
             default: return null;
         }
     },
-    async subscribe(params, onFrame) {
+    async subscribe(params) {
         if (!params.topics?.includes('msg.state')) return () => {};
-        if (!demoMailOn()) throw mailDenied();
-        let n = 0;
-        return demoMailSubscribe(data => onFrame({ v: 1, type: 'event', sub: 'demo-mail', topic: 'msg.state', subject: data.to, cursor: `demo:mail:${++n}`, ts: data.at, data }));
+        throw Object.assign(new Error('Mail is not available'), { code: 'not_allowed', msg: 'Mail is not available' });
     }
 };

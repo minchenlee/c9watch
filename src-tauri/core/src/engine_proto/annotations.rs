@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotationTarget {
     /// Open enum; only session targets are supported in preview.
@@ -13,7 +12,6 @@ pub struct AnnotationTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum AnnotationValue {
     Number { v: f64 },
@@ -24,7 +22,6 @@ pub enum AnnotationValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Annotation {
     pub target: AnnotationTarget,
@@ -48,7 +45,6 @@ pub struct Annotation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotationSetParams {
     pub target: AnnotationTarget,
@@ -65,23 +61,19 @@ pub struct AnnotationSetParams {
     pub ttl_seconds: Option<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AnnotationSetResult {
     pub annotation: Annotation,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AnnotationDeleteParams {
     pub target: AnnotationTarget,
     pub key: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AnnotationDeleteResult {
     pub deleted: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotationPatchParams {
     pub target: AnnotationTarget,
@@ -95,7 +87,6 @@ pub struct AnnotationPatchParams {
     pub seq: Option<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AnnotationChangedEvent {
     pub target: AnnotationTarget,
     pub source: String,
@@ -103,7 +94,6 @@ pub struct AnnotationChangedEvent {
     pub values: BTreeMap<String, Annotation>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AnnotationPatchResult {
     /// False means the sequence was already accepted or is stale.
     pub applied: bool,
@@ -112,7 +102,6 @@ pub struct AnnotationPatchResult {
     pub values: BTreeMap<String, Annotation>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AnnotationRemovedEvent {
     pub target: AnnotationTarget,
     pub key: String,
@@ -120,7 +109,6 @@ pub struct AnnotationRemovedEvent {
     pub reason: String,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AnnotationListParams {
     #[serde(default)]
     pub target: Option<AnnotationTarget>,
@@ -128,7 +116,6 @@ pub struct AnnotationListParams {
     pub namespace: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AnnotationListResult {
     /// Snapshot cursor; subscribe from it to close the list/watch race.
     pub cursor: String,

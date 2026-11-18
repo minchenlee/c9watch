@@ -22,7 +22,7 @@ The socket is private to your OS user. Find `engine-v1.sock` under:
 | macOS | `~/Library/Application Support/c9watch/engine/` |
 | Linux | `$XDG_RUNTIME_DIR/c9watch/engine-v1.sock` when the runtime dir is set; else `$XDG_STATE_HOME/c9watch/engine/` (or `~/.local/state/c9watch/engine/`) |
 
-Development builds use `engine-dev/`. `C9WATCH_ENGINE_HOME` overrides the whole home with an absolute path. Do not mix development and production sockets. On Linux the default socket lives in the runtime directory; see [Linux](linux.md). A custom home keeps its socket inside the home.
+Development builds use `engine-dev/`. `C9WATCH_ENGINE_HOME` overrides the whole home with an absolute path. Do not mix development and production sockets. A custom home keeps its socket inside the home.
 
 Send one JSON object per line over a Unix stream socket. Send `hello` first:
 
@@ -40,7 +40,6 @@ Read next:
 - [Extending](extending.md): exports and external aggregation.
 - [Glass extensions](extensions.md): trust, directories, the `c9ext.json` manifest, `c9watch ext check` and the `c9ui/1` API.
 - [Changelog](CHANGELOG.md): preview changes by minor.
-- [Linux](linux.md): headless core install, socket paths and the optional systemd service.
 - [TypeScript SDK](../../packages/c9p-client/README.md): Node socket and browser/Node WebSocket transports.
 - [Python watch](../../examples/python-watch/README.md) and [web board](../../examples/ts-web-board/README.md): runnable clients.
 

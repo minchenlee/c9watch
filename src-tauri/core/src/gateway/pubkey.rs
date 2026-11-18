@@ -479,7 +479,5 @@ mod tests {
         assert_eq!(parse_hex::<2>("0aff00"), None);
         assert_eq!(parse_hex::<2>("+aff"), None);
         assert_eq!(parse_hex::<1>("é"), None);
-        #[cfg(feature = "engine")]
-        assert!(valid_client_id(&crate::gateway::tokens::new_client_id()));
     }
 }

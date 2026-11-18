@@ -605,15 +605,6 @@ fn notes(m: &Manifest, has_core: bool) -> Vec<String> {
                 }
             }
         }
-        #[cfg(all(unix, feature = "engine"))]
-        if let Some(n) = mv.api_minor {
-            let have = crate::engine_proto::wire::API_MINOR;
-            if f64::from(have) < n {
-                out.push(format!(
-                    "這個 c9watch 的 c9p 是 1.{have}，比 minVersion.apiMinor {n} 舊：會標 version_mismatch"
-                ));
-            }
-        }
     }
     out
 }

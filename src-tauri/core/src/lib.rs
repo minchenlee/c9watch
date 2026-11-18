@@ -14,7 +14,7 @@ pub mod debug_log;
 pub mod log_line;
 pub mod session;
 
-#[cfg(any(feature = "gui", all(unix, feature = "engine")))]
+#[cfg(feature = "gui")]
 pub mod gateway;
 
 #[cfg(feature = "gui")]
@@ -25,12 +25,10 @@ pub mod auth;
 pub mod cli;
 
 // ── Engine module (opt-in) ──────────────────────────────────────────
-#[cfg(feature = "engine")]
-pub mod engine;
 
 // c9p/1 client side (wire types, engine home, blocking client). Not behind
 // the `engine` feature: the dev channel GUI reads the engine through it.
-#[cfg(all(unix, any(feature = "gui", feature = "engine")))]
+#[cfg(all(unix, feature = "gui"))]
 pub mod engine_proto;
 
 /// Append a `custom-title` entry to the session's JSONL file in Claude Code's native format.

@@ -159,7 +159,6 @@ test('demo transport: glass answers only while the glass shell runs, whatever lo
     urls['../demo/data'] = stub(`export const getDemoSessions = () => ['classic-sessions']; export const getDemoHistoryEntries = () => ['classic-history'];
         export const getDemoCostData = () => ({ classic: 'cost' }); export const demoConversations = {}; export const getDemoAwayActivity = () => ({}); export const getDemoDiagnostics = () => null;`);
     urls['../subscription-usage'] = stub('export const demoSubscriptionUsage = () => [];');
-    urls['./demo/mail'] = stub('export const demoMailRequest = () => null; export const demoMailSubscribe = () => () => {};');
     urls['./demo/glass'] = stub(`export const glassDemoAgents = () => ['glass']; export const glassDemoAnnotations = () => ['glass']; export const glassDemoSessionViews = () => ['glass'];
         export const glassDemoHistory = () => ['glass']; export const glassDemoCost = () => ({ glass: 'cost' }); export const glassDemoMemory = () => ['glass']; export const glassDemoAway = () => ({ glass: 'away' });`);
     const demo = await load('$lib/data/demo', '../src/lib/data/demo.ts');

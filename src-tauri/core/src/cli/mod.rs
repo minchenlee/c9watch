@@ -17,32 +17,14 @@ pub enum CostSortDir {
     Desc,
 }
 
-#[cfg(all(unix, feature = "engine"))]
-mod annotate;
 mod api_schema;
 mod cost;
-#[cfg(all(unix, feature = "engine"))]
-mod export;
 pub mod ext;
 mod session_json;
 mod session_ref;
 // Engine commands talk to the engine over a unix socket. `api schema`
 // also works offline without the engine feature. `task`
 // holds the calls of the separate `c9watch-agent` binary (C1a-21).
-#[cfg(all(unix, feature = "engine"))]
-pub mod engine_client;
-#[cfg(all(unix, feature = "engine"))]
-pub mod engine_mail;
-#[cfg(all(unix, feature = "engine"))]
-pub mod engine_send;
-#[cfg(all(unix, feature = "engine"))]
-pub mod engine_sessions;
-#[cfg(all(unix, feature = "engine"))]
-pub mod engine_spawn;
-#[cfg(all(unix, feature = "engine"))]
-pub mod engine_wait;
-#[cfg(all(unix, feature = "engine"))]
-pub mod task;
 
 use cost::cmd_cost;
 use session_json::{
@@ -69,17 +51,7 @@ pub const CLI_COMMANDS: &[&str] = &[
     "watch",
     "wait",
     "tasks",
-    #[cfg(all(unix, feature = "engine"))]
-    "engine",
     "api",
-    #[cfg(all(unix, feature = "engine"))]
-    "export",
-    #[cfg(all(unix, feature = "engine"))]
-    "auth",
-    #[cfg(all(unix, feature = "engine"))]
-    "annotate",
-    #[cfg(all(unix, feature = "engine"))]
-    "integration",
     "spawn",
     "send",
     "mail",
@@ -134,79 +106,20 @@ pub struct Cli {
 /// finds sessions. An engine build adds `--direct`; in other builds it
 /// holds nothing, so the release CLI is unchanged.
 #[derive(clap::Args, Debug, Clone, Default)]
-pub struct DetectArgs {
-    /// Detect sessions in this process instead of asking the engine
-    #[cfg(all(unix, feature = "engine"))]
-    #[arg(long)]
-    pub direct: bool,
-}
+pub struct DetectArgs {}
 
-impl DetectArgs {
-    /// Whether to read sessions from the engine (C1a-36): not with
-    /// `--direct`, and not inside an engine agent (`C9_AGENT_ID` set, N5).
-    #[cfg(all(unix, feature = "engine"))]
-    fn via_engine(&self) -> bool {
-        engine_sessions::use_engine(self.direct, &|k| std::env::var_os(k))
-    }
-}
+impl DetectArgs {}
 
 /// `spawn --mode` (C1a-38). An engine build adds the flag; in other builds
 /// this holds nothing.
 #[derive(clap::Args, Debug, Clone, Default)]
-pub struct SpawnModeArgs {
-    /// `managed` (default): unavailable legacy worker mode.
-    /// `free`: an engine agent in --cwd (agent.create), with only --cwd and
-    /// --name
-    #[cfg(all(unix, feature = "engine"))]
-    #[arg(long, value_enum, default_value_t = engine_spawn::SpawnMode::Managed)]
-    pub mode: engine_spawn::SpawnMode,
-}
+pub struct SpawnModeArgs {}
 
 /// `wait --event turn_ended --agent X` (C1a-37). An engine build adds the
 /// flags; in other builds it holds nothing, so the release CLI is
 /// unchanged.
 #[derive(clap::Args, Debug, Clone, Default)]
-pub struct WaitEventArgs {
-    /// Wait for this event of one engine agent (`--agent`) instead of a
-    /// session condition. `turn_ended`: the agent's next turn end, which
-    /// means only that it is idle. Exit codes: 0 the turn ended, 2 no live
-    /// engine agent matches, 3 the agent stopped first, 124 timeout
-    #[cfg(all(unix, feature = "engine"))]
-    #[arg(
-        long,
-        value_enum,
-        requires = "agent",
-        conflicts_with_all = ["session_id", "until", "interval", "direct"]
-    )]
-    pub event: Option<engine_wait::WaitEvent>,
-
-    /// The engine agent for `--event`: its id (`agt_...`) or name
-    #[cfg(all(unix, feature = "engine"))]
-    #[arg(long, requires = "event")]
-    pub agent: Option<String>,
-
-    /// For `--event`: count events after this engine cursor (the `cursor`
-    /// of the last line `wait` printed, or one taken before a send) instead
-    /// of after now. Without it a turn that ended before the wait started
-    /// does not count, and without `--timeout` the wait can last until the
-    /// next turn ends
-    #[cfg(all(unix, feature = "engine"))]
-    #[arg(long, requires = "event")]
-    pub since: Option<String>,
-}
-
-#[cfg(all(unix, feature = "engine"))]
-#[derive(Subcommand)]
-pub enum AuthAction {
-    /// Whether this connection may call a method (does not execute it)
-    CanI {
-        method: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// List this connection's methods, topics, scopes and ceiling
-    Rules,
-}
+pub struct WaitEventArgs {}
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -343,21 +256,11 @@ pub enum Commands {
     /// `done` is met at once when the session is not Working at the start.
     Wait {
         /// Session key (`provider:id`), session ID, or unique prefix of a live session
-        #[cfg(not(all(unix, feature = "engine")))]
         session_id: String,
-        /// Session key (`provider:id`), session ID, or unique prefix of a live session
-        #[cfg(all(unix, feature = "engine"))]
-        #[arg(required_unless_present = "event")]
-        session_id: Option<String>,
 
         /// Condition to wait for
-        #[cfg(not(all(unix, feature = "engine")))]
         #[arg(long, value_enum)]
         until: watch::Until,
-        /// Condition to wait for
-        #[cfg(all(unix, feature = "engine"))]
-        #[arg(long, value_enum, required_unless_present = "event")]
-        until: Option<watch::Until>,
 
         /// Give up after this many seconds (exit 124). Default: wait forever
         #[arg(long)]
@@ -380,49 +283,6 @@ pub enum Commands {
         session_id: String,
     },
 
-    /// Spawn an engine agent with --mode free
-    #[cfg(all(unix, feature = "engine"))]
-    Spawn {
-        #[arg(long)]
-        cwd: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        append_system_prompt: Option<String>,
-        #[arg(long)]
-        append_system_prompt_file: Option<String>,
-        /// Legacy managed-worker option (unavailable with --mode free)
-        #[cfg(all(unix, feature = "engine"))]
-        #[arg(long)]
-        permission_mode: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long)]
-        add_dir: Vec<String>,
-        /// Legacy managed-worker option (unavailable with --mode free)
-        #[arg(long)]
-        prompt: Option<String>,
-
-        #[command(flatten)]
-        mode: SpawnModeArgs,
-    },
-
-    /// Mail an engine agent: it reads the message as its next prompt.
-    /// Prints `{"msg": ...}`; with `--wait`, a second line once the agent's
-    /// turn after the message ended. Exit codes: 0 sent (answered), 1 an
-    /// engine error or not delivered, 2 `--wait` timed out
-    #[cfg(all(unix, feature = "engine"))]
-    Send(engine_send::SendArgs),
-    #[cfg(all(unix, feature = "engine"))]
-    Mail(engine_mail::MailArgs),
-
-    /// Run the c9 engine in the foreground, or control it
-    #[cfg(all(unix, feature = "engine"))]
-    Engine {
-        #[command(subcommand)]
-        action: Option<EngineAction>,
-    },
-
     /// Export the embedded schema, or send a raw c9p/1 request (engine build)
     Api {
         /// Method name, e.g. `hello`
@@ -433,29 +293,6 @@ pub enum Commands {
         /// Omit private methods, topics, fields and types (schema only)
         #[arg(long = "public")]
         public_only: bool,
-    },
-
-    /// Export data through c9p; starts core if needed
-    #[cfg(all(unix, feature = "engine"))]
-    Export(export::ExportArgs),
-    /// Set, clear or list typed values on sessions
-    #[cfg(all(unix, feature = "engine"))]
-    Annotate {
-        #[command(subcommand)]
-        action: annotate::Action,
-    },
-    /// Inspect the caller's own engine permissions
-    #[cfg(all(unix, feature = "engine"))]
-    Auth {
-        #[command(subcommand)]
-        action: AuthAction,
-    },
-
-    /// Show the engine's agent adapters and their integration files
-    #[cfg(all(unix, feature = "engine"))]
-    Integration {
-        #[command(subcommand)]
-        action: IntegrationAction,
     },
 
     /// Check an extension directory before you share or install it
@@ -491,31 +328,6 @@ pub enum Commands {
         /// Show cost breakdown for a single session by id prefix (any length, must be unique). Incompatible with --daily/--weekly/--project.
         #[arg(long, conflicts_with_all = ["daily", "weekly", "project", "session"])]
         session_prefix: Option<String>,
-    },
-}
-
-#[cfg(all(unix, feature = "engine"))]
-#[derive(Subcommand)]
-pub enum EngineAction {
-    /// Stop core (agents drain); the GUI never stops it on quit
-    Stop,
-    /// Stop the engine with SIGTERM and wait for a new one to answer hello
-    Restart,
-    /// Print the dev GUI's daily shadow diff coverage (dev builds only)
-    #[cfg(c9_channel_dev)]
-    ShadowReport,
-}
-
-#[cfg(all(unix, feature = "engine"))]
-#[derive(Subcommand)]
-pub enum IntegrationAction {
-    /// Each adapter's descriptor and integration status
-    Status,
-    /// Print an adapter's integration file (for claude: the hooks block of
-    /// the per-spawn --settings file)
-    Show {
-        /// Adapter kind, e.g. `claude`
-        kind: String,
     },
 }
 
@@ -582,15 +394,6 @@ pub fn run(cli: Cli) {
             Err(e) => Err(e),
         },
         Commands::Tasks { session_id } => cmd_tasks(&session_id, cli.pretty),
-        #[cfg(all(unix, feature = "engine"))]
-        Commands::Engine { action } => match action {
-            None => engine_client::cmd_engine_run(),
-            Some(EngineAction::Restart) => engine_client::cmd_engine_restart(cli.pretty),
-            Some(EngineAction::Stop) => crate::engine::home::engine_home()
-                .and_then(|home| crate::engine_proto::spawn::stop_engine(&home)),
-            #[cfg(c9_channel_dev)]
-            Some(EngineAction::ShadowReport) => engine_client::cmd_shadow_report(cli.pretty),
-        },
         Commands::Api {
             method,
             params,
@@ -605,57 +408,11 @@ pub fn run(cli: Cli) {
                 if public_only {
                     return Err("--public is only valid for api schema".into());
                 }
-                #[cfg(all(unix, feature = "engine"))]
-                {
-                    engine_client::cmd_api(&method, &params, cli.pretty)
-                }
-                #[cfg(not(all(unix, feature = "engine")))]
                 {
                     Err("Raw API calls need an engine build; api schema works offline".into())
                 }
             }
         })(),
-        #[cfg(all(unix, feature = "engine"))]
-        Commands::Export(args) => export::run(args),
-        #[cfg(all(unix, feature = "engine"))]
-        Commands::Annotate { action } => annotate::run(action, cli.pretty),
-        #[cfg(all(unix, feature = "engine"))]
-        Commands::Auth { action } => engine_client::cmd_auth(&action, cli.pretty),
-        #[cfg(all(unix, feature = "engine"))]
-        Commands::Integration { action } => engine_client::cmd_integration(&action, cli.pretty),
-        #[cfg(all(unix, feature = "engine"))]
-        Commands::Spawn {
-            cwd,
-            name,
-            append_system_prompt,
-            append_system_prompt_file,
-            permission_mode,
-            model,
-            add_dir,
-            prompt,
-            mode,
-        } => spawn_command(
-            SpawnFlags {
-                cwd,
-                name,
-                append_system_prompt,
-                append_system_prompt_file,
-                permission_mode: permission_mode.into(),
-                model,
-                add_dir,
-                prompt,
-            },
-            &mode,
-            cli.pretty,
-        ),
-        #[cfg(all(unix, feature = "engine"))]
-        Commands::Mail(args) => engine_mail::cmd_mail(&args, cli.pretty),
-        #[cfg(all(unix, feature = "engine"))]
-        Commands::Send(args) => match engine_send::cmd_send(&args, cli.pretty) {
-            Ok(0) => Ok(()),
-            Ok(code) => process::exit(code),
-            Err(e) => Err(e),
-        },
         Commands::Ext { action } => ext::run(action, cli.pretty),
         Commands::Cost {
             daily,
@@ -706,10 +463,6 @@ fn cmd_list(
     pretty: bool,
     detect: &DetectArgs,
 ) -> Result<(), String> {
-    #[cfg(all(unix, feature = "engine"))]
-    if detect.via_engine() {
-        return engine_sessions::cmd_list(project_filter, status_filter, compact, pretty);
-    }
     let _ = detect;
     let (sessions, diagnostics) = session::enrichment::detect_and_enrich_sessions()?;
 
@@ -748,10 +501,6 @@ fn cmd_status(
     pretty: bool,
     detect: &DetectArgs,
 ) -> Result<(), String> {
-    #[cfg(all(unix, feature = "engine"))]
-    if detect.via_engine() {
-        return engine_sessions::cmd_status(project_filter, pretty);
-    }
     let _ = detect;
     let (sessions, _) = session::enrichment::detect_and_enrich_sessions()?;
 
@@ -891,10 +640,6 @@ fn cmd_self(pretty: bool, detect: &DetectArgs) -> Result<(), String> {
     let claude_pid = find_claude_ancestor(my_pid)
         .ok_or("No claude parent process found — this command must be called from within a Claude Code session")?;
 
-    #[cfg(all(unix, feature = "engine"))]
-    if detect.via_engine() {
-        return engine_sessions::cmd_self(claude_pid, pretty);
-    }
     let _ = detect;
 
     // Find the matching session
@@ -1041,10 +786,6 @@ fn cmd_watch(
     changes_only: bool,
     detect: &DetectArgs,
 ) -> Result<(), String> {
-    #[cfg(all(unix, feature = "engine"))]
-    if detect.via_engine() {
-        return engine_sessions::cmd_watch(project_filter, compact, changes_only);
-    }
     let _ = detect;
     let interval = std::time::Duration::from_secs(interval_secs);
     let mut prev = std::collections::HashMap::new();
@@ -1059,48 +800,6 @@ fn cmd_watch(
     }
 }
 
-/// The flags of `c9watch spawn`, as parsed.
-#[cfg(all(unix, feature = "engine"))]
-struct SpawnFlags {
-    cwd: Option<String>,
-    name: Option<String>,
-    append_system_prompt: Option<String>,
-    append_system_prompt_file: Option<String>,
-    /// `None`: not given.
-    permission_mode: Option<String>,
-    model: Option<String>,
-    add_dir: Vec<String>,
-    prompt: Option<String>,
-}
-
-/// `c9watch spawn --mode free` calls `agent.create` (C1a-38).
-/// The default `--mode managed` remains unavailable.
-#[cfg(all(unix, feature = "engine"))]
-fn spawn_command(f: SpawnFlags, mode: &SpawnModeArgs, pretty: bool) -> Result<(), String> {
-    #[cfg(all(unix, feature = "engine"))]
-    if mode.mode == engine_spawn::SpawnMode::Free {
-        engine_spawn::check_free_flags(&engine_spawn::ManagedFlags {
-            append_system_prompt: f.append_system_prompt.is_some(),
-            append_system_prompt_file: f.append_system_prompt_file.is_some(),
-            permission_mode: f.permission_mode.is_some(),
-            model: f.model.is_some(),
-            add_dir: !f.add_dir.is_empty(),
-            prompt: f.prompt.is_some(),
-        })?;
-        return engine_spawn::cmd_spawn_free(f.cwd.as_deref(), f.name.as_deref(), pretty);
-    }
-    let _ = mode;
-    spawn_managed(f, pretty)
-}
-
-/// Legacy managed workers are unavailable.
-#[cfg(all(unix, feature = "engine"))]
-fn spawn_managed(_f: SpawnFlags, _pretty: bool) -> Result<(), String> {
-    Err("bad_args: --mode managed is unavailable; \
-         use --mode free for an engine agent"
-        .into())
-}
-
 /// One read of the live sessions for `wait` (and the engine's `watch`):
 /// the snapshots and the payloads their event lines take.
 pub(crate) enum Poll<L> {
@@ -1108,13 +807,12 @@ pub(crate) enum Poll<L> {
     /// This read failed; a later one may work.
     Missed,
     /// No read will work again.
-    #[cfg_attr(not(all(unix, feature = "engine")), allow(dead_code))]
+    #[allow(dead_code)]
     Failed(String),
 }
 
 /// `c9watch wait` as parsed: the session form, or in an engine build
 /// `--event turn_ended --agent X` (C1a-37).
-#[cfg(not(all(unix, feature = "engine")))]
 fn wait_command(
     session_id: String,
     until: watch::Until,
@@ -1124,28 +822,6 @@ fn wait_command(
     _event: &WaitEventArgs,
 ) -> Result<i32, String> {
     cmd_wait(&session_id, until, timeout_secs, interval_secs, detect)
-}
-
-/// `c9watch wait` as parsed: the session form, or in an engine build
-/// `--event turn_ended --agent X` (C1a-37).
-#[cfg(all(unix, feature = "engine"))]
-fn wait_command(
-    session_id: Option<String>,
-    until: Option<watch::Until>,
-    timeout_secs: Option<u64>,
-    interval_secs: u64,
-    detect: &DetectArgs,
-    event: &WaitEventArgs,
-) -> Result<i32, String> {
-    if let (Some(engine_wait::WaitEvent::TurnEnded), Some(agent)) = (event.event, &event.agent) {
-        return engine_wait::cmd_wait_turn(agent, event.since.as_deref(), timeout_secs);
-    }
-    match (session_id, until) {
-        (Some(session_id), Some(until)) => {
-            cmd_wait(&session_id, until, timeout_secs, interval_secs, detect)
-        }
-        _ => Err("wait needs <SESSION_ID> --until, or --event with --agent".into()),
-    }
 }
 
 /// `c9watch wait`: returns the process exit code (see `watch::EXIT_*`).
@@ -1159,10 +835,6 @@ fn cmd_wait(
     interval_secs: u64,
     detect: &DetectArgs,
 ) -> Result<i32, String> {
-    #[cfg(all(unix, feature = "engine"))]
-    if detect.via_engine() {
-        return engine_sessions::cmd_wait(reference, until, timeout_secs);
-    }
     let _ = detect;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -1352,8 +1024,6 @@ mod dispatch_tests {
         else {
             panic!("not a wait command");
         };
-        #[cfg(all(unix, feature = "engine"))]
-        let (session_id, until) = (session_id.unwrap(), until.unwrap());
         assert_eq!(session_id, "abc");
         assert_eq!(until, watch::Until::NeedsInput);
         assert_eq!(timeout, Some(5));
@@ -1368,74 +1038,7 @@ mod dispatch_tests {
     fn wait_event_is_an_engine_build_form() {
         let event = ["c9watch", "wait", "--event", "turn_ended", "--agent", "w"];
         let parsed = Cli::try_parse_from(event);
-        #[cfg(all(unix, feature = "engine"))]
-        {
-            let cli = parsed.unwrap();
-            let Commands::Wait {
-                session_id,
-                until,
-                event,
-                timeout,
-                ..
-            } = cli.command
-            else {
-                panic!("not a wait command");
-            };
-            assert_eq!(event.event, Some(engine_wait::WaitEvent::TurnEnded));
-            assert_eq!(event.agent.as_deref(), Some("w"));
-            assert_eq!((session_id, until, timeout), (None, None, None));
-            let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
-            assert!(ok(&[&event_args()[..], &["--timeout", "3"]].concat()));
-            for bad in [
-                &["c9watch", "wait", "--event", "turn_ended"][..],
-                &["c9watch", "wait", "--agent", "w"],
-                &["c9watch", "wait", "--event", "turn-ended", "--agent", "w"],
-                &[&event_args()[..], &["abc"]].concat(),
-                &[&event_args()[..], &["--until", "done"]].concat(),
-                &[&event_args()[..], &["--direct"]].concat(),
-                &[&event_args()[..], &["--interval", "3"]].concat(),
-                &["c9watch", "wait", "--until", "done"],
-                &["c9watch", "wait"],
-            ] {
-                assert!(!ok(bad), "{bad:?} parsed");
-            }
-        }
-        #[cfg(not(all(unix, feature = "engine")))]
         assert!(parsed.is_err(), "wait --event parsed in a release CLI");
-    }
-
-    /// `spawn --mode` exists only in engine builds (C1a-38) and defaults to
-    /// `managed`.
-    #[cfg(all(unix, feature = "engine"))]
-    #[test]
-    fn spawn_mode_is_an_engine_build_flag() {
-        let parsed = Cli::try_parse_from(["c9watch", "spawn", "--mode", "free", "--cwd", "/w"]);
-        #[cfg(all(unix, feature = "engine"))]
-        {
-            let mode_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
-                Commands::Spawn { mode, .. } => mode.mode,
-                _ => panic!("{args:?}: not a spawn command"),
-            };
-            assert_eq!(
-                mode_of(&["c9watch", "spawn"]),
-                engine_spawn::SpawnMode::Managed
-            );
-            assert_eq!(
-                mode_of(&["c9watch", "spawn", "--mode", "managed"]),
-                engine_spawn::SpawnMode::Managed
-            );
-            let Commands::Spawn { cwd, mode, .. } = parsed.unwrap().command else {
-                panic!("not a spawn command");
-            };
-            assert_eq!(mode.mode, engine_spawn::SpawnMode::Free);
-            assert_eq!(cwd.as_deref(), Some("/w"));
-            assert!(Cli::try_parse_from(["c9watch", "spawn", "--mode", "orch"]).is_err());
-        }
-    }
-
-    #[cfg(all(unix, feature = "engine"))]
-    fn event_args() -> Vec<&'static str> {
-        vec!["c9watch", "wait", "--event", "turn_ended", "--agent", "w"]
     }
 
     /// `--direct` exists only in engine builds, on the five detection
@@ -1451,27 +1054,12 @@ mod dispatch_tests {
         ];
         for args in with_direct {
             let parsed = Cli::try_parse_from(args);
-            #[cfg(all(unix, feature = "engine"))]
-            {
-                let cli = parsed.unwrap_or_else(|e| panic!("{args:?}: {e}"));
-                let detect = match cli.command {
-                    Commands::List { detect, .. }
-                    | Commands::Status { detect, .. }
-                    | Commands::SelfId { detect }
-                    | Commands::Watch { detect, .. }
-                    | Commands::Wait { detect, .. } => detect,
-                    _ => panic!("{args:?}: wrong command"),
-                };
-                assert!(detect.direct, "{args:?}");
-            }
-            #[cfg(not(all(unix, feature = "engine")))]
             assert!(parsed.is_err(), "{args:?} parsed in a release CLI");
         }
         assert!(Cli::try_parse_from(["c9watch", "view", "abc", "--direct"]).is_err());
     }
 
     /// A release CLI (`--features cli`) has no engine commands (v3.1 M-a).
-    #[cfg(not(feature = "engine"))]
     #[test]
     fn cli_build_has_no_engine_commands() {
         for name in ["engine", "export", "task", "integration"] {
@@ -1483,97 +1071,5 @@ mod dispatch_tests {
             // Clap reports the unknown command; the GUI does not launch.
             assert!(is_cli_invocation(name), "{name} would launch the GUI");
         }
-    }
-
-    #[cfg(all(unix, feature = "engine"))]
-    #[test]
-    fn engine_and_api_parse_and_route() {
-        for name in ["engine", "api"] {
-            assert!(is_cli_invocation(name));
-        }
-        let cli = Cli::try_parse_from(["c9watch", "engine"]).unwrap();
-        assert!(matches!(cli.command, Commands::Engine { action: None }));
-        let cli = Cli::try_parse_from(["c9watch", "engine", "restart"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Engine {
-                action: Some(EngineAction::Restart)
-            }
-        ));
-        let cli = Cli::try_parse_from(["c9watch", "api", "hello"]).unwrap();
-        let Commands::Api { method, params, .. } = cli.command else {
-            panic!("not api");
-        };
-        assert_eq!((method.as_str(), params.as_str()), ("hello", "{}"));
-        let cli = Cli::try_parse_from(["c9watch", "api", "x", r#"{"a":1}"#]).unwrap();
-        assert!(matches!(cli.command, Commands::Api { params, .. } if params == r#"{"a":1}"#));
-    }
-
-    /// `engine shadow-report` exists only in dev channel builds (C1a-17).
-    #[cfg(all(unix, feature = "engine"))]
-    #[test]
-    fn shadow_report_only_in_dev_builds() {
-        let parsed = Cli::try_parse_from(["c9watch", "engine", "shadow-report"]);
-        #[cfg(c9_channel_dev)]
-        assert!(matches!(
-            parsed.unwrap().command,
-            Commands::Engine {
-                action: Some(EngineAction::ShadowReport)
-            }
-        ));
-        #[cfg(not(c9_channel_dev))]
-        assert!(parsed.is_err());
-    }
-
-    #[cfg(all(unix, feature = "engine"))]
-    #[test]
-    fn integration_parses_and_routes() {
-        assert!(is_cli_invocation("integration"));
-        let cli = Cli::try_parse_from(["c9watch", "integration", "status"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Integration {
-                action: IntegrationAction::Status
-            }
-        ));
-        let cli = Cli::try_parse_from(["c9watch", "integration", "show", "claude"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Integration {
-                action: IntegrationAction::Show { kind }
-            } if kind == "claude"
-        ));
-        assert!(Cli::try_parse_from(["c9watch", "integration"]).is_err());
-        // No global install in C1a: managed CC gets its hooks per spawn.
-        assert!(Cli::try_parse_from(["c9watch", "integration", "install"]).is_err());
-    }
-
-    /// `task done` lives only in `c9watch-agent` (C1a-21): the main binary
-    /// has no `task`, so done has one path. Clap reports it; the GUI does
-    /// not launch.
-    #[cfg(all(unix, feature = "engine"))]
-    #[test]
-    fn the_main_binary_has_no_task_command() {
-        assert!(!CLI_COMMANDS.contains(&"task"));
-        assert!(is_cli_invocation("task"));
-        assert!(Cli::try_parse_from(["c9watch", "task", "done", "--report", "ok"]).is_err());
-    }
-    #[cfg(all(unix, feature = "engine"))]
-    #[test]
-    fn auth_commands_route_to_cli_and_parse_self_queries() {
-        assert!(is_cli_invocation("auth"));
-        let parsed =
-            Cli::try_parse_from(["c9watch", "auth", "can-i", "conversation.get", "--json"])
-                .unwrap();
-        assert!(
-            matches!(parsed.command, Commands::Auth { action: AuthAction::CanI { method, json: true } } if method == "conversation.get")
-        );
-        let parsed = Cli::try_parse_from(["c9watch", "auth", "rules"]).unwrap();
-        assert!(matches!(
-            parsed.command,
-            Commands::Auth {
-                action: AuthAction::Rules
-            }
-        ));
     }
 }

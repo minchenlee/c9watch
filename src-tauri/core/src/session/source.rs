@@ -23,7 +23,6 @@ pub enum SessionDetectorError {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SessionKind {
     Interactive,
@@ -42,7 +41,6 @@ pub enum CliActivity {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum SessionProvider {
     #[default]
@@ -98,7 +96,6 @@ impl SessionProvider {
 /// This is deliberately separate from `SessionStatus`: a session can be
 /// waiting for input while its source is fresh, partial, or unavailable.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum SourceHealth {
     Fresh,
@@ -133,7 +130,6 @@ pub fn health_from_last_timestamp(last_timestamp: &str, stale_after_secs: u64) -
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum SessionSurface {
     #[default]
@@ -147,7 +143,6 @@ pub enum SessionSurface {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum AgentKind {
     #[default]
@@ -209,7 +204,6 @@ impl SessionIdentity {
     }
 }
 
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectionDiagnostics {

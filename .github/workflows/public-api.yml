@@ -39,11 +39,6 @@ jobs:
           npx tsc -p examples/ts-web-board/tsconfig.json
           npx tsc -p examples/ts-web-board/tsconfig.smoke.json
           npx vite build examples/ts-web-board --outDir dist
-      - name: Contract, Python watcher, web reducer and exports on a fixture engine
-        env:
-          C9P_DOC_EXAMPLES: '1'
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features engine --test engine_public_docs
       - name: CLI-only offline schema export
         run: |
           cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --features cli -- api schema --public > /tmp/c9p-public.json

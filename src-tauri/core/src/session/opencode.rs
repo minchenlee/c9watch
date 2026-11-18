@@ -352,8 +352,6 @@ static CACHE: LazyLock<Arc<Mutex<Cache>>> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "engine", schemars(rename = "OpencodeStatus"))]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionStatus {
     url: String,

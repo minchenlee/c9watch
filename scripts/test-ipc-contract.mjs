@@ -122,12 +122,8 @@ test('stop_session is invoked with a session key, not a bare pid', () => {
   assert.match(libRs, /async fn stop_session\([^)]*session_key: String/);
 });
 
-// c9p/1: docs/api/c9p-1.json comes from the engine's serde types (the Rust
-// test `schema_file_is_current` fails when it is stale), and src/lib/c9p-1.ts
-// comes from that file.
+// c9p/1: src/lib/c9p-1.ts comes from docs/api/c9p-1.json.
 const c9pSchema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf8'));
-const engineApi = readFileSync(join(root, 'src-tauri/core/src/engine/api.rs'), 'utf8');
-const wire = readFileSync(join(root, 'src-tauri/core/src/engine_proto/wire.rs'), 'utf8');
 
 test('c9p/1 TS types are generated from the current schema', () => {
   assert.equal(
@@ -135,26 +131,6 @@ test('c9p/1 TS types are generated from the current schema', () => {
     generate(c9pSchema),
     'src/lib/c9p-1.ts is stale: run `node scripts/gen-c9p-types.mjs`'
   );
-});
-
-test('c9p/1 schema lists exactly the methods the engine serves', () => {
-  const list = engineApi.match(/pub const METHODS: &\[&str\] = &\[([^\]]*)\]/);
-  assert.ok(list, 'METHODS not found in engine/api.rs');
-  const methods = matches(list[1], /"([a-z._]+)"/g);
-  assert.deepEqual(sorted(Object.keys(c9pSchema.methods)), sorted(methods));
-  const dispatch = engineApi.match(/async fn execute\([\s\S]*?\n\}/);
-  assert.ok(dispatch, 'authorized handler dispatch not found in engine/api.rs');
-  const served = matches(dispatch[0], /^\s*"([a-z._]+)" =>/gm);
-  served.add('hello'); // handled before dispatch
-  // Hook-class methods (C1a-21): `task.done` and `agent.handoff` by name,
-  // every `hook.*` in HOOK_METHODS.
-  const hookClass = engineApi.match(/async fn hook_class\([\s\S]*?\n\}/);
-  assert.ok(hookClass, 'hook_class not found in engine/api.rs');
-  for (const m of matches(hookClass[0], /^\s*"([a-z._]+)" =>/gm)) served.add(m);
-  const hooks = wire.match(/pub const HOOK_METHODS: &\[&str\] = &\[([^\]]*)\]/);
-  assert.ok(hooks, 'HOOK_METHODS not found in engine_proto/wire.rs');
-  for (const m of matches(hooks[1], /"([a-z._]+)"/g)) served.add(m);
-  assert.deepEqual(sorted(served), sorted(methods));
 });
 
 test('every c9p/1 $ref resolves', () => {
