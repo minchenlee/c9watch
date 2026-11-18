@@ -1,13 +1,9 @@
 import { defineConfig, devices } from '@playwright/test';
-import { fileURLToPath } from 'node:url';
 
-// Glass interaction tests that need the Vite dev server: the extension
-// host (G6) loads extensions from the dev-only `/c9ext/*` endpoint, and
-// the `dev: true` hello extension shows only in a dev build. Its own port,
-// so it never meets the visual suites on 4179.
+// Glass interaction tests on the Vite dev server. Its own port, so it
+// never meets the visual suites on 4179.
 // Run: npx playwright test -c tests/glass/playwright.config.ts
 const PORT = 4181;
-const engineHome = fileURLToPath(new URL('./fixtures/engine-home', import.meta.url));
 
 export default defineConfig({
 	testDir: '.',
@@ -33,9 +29,6 @@ export default defineConfig({
 	webServer: {
 		command: `npx vite dev --host 127.0.0.1 --port ${PORT} --strictPort`,
 		cwd: '../..',
-		// The fixture extensions (a throwing one, a silent one, bad manifests,
-		// a shadowed copy of hello) sit in the third-party root.
-		env: { C9WATCH_ENGINE_HOME: engineHome },
 		url: `http://127.0.0.1:${PORT}`,
 		reuseExistingServer: false,
 		timeout: 180_000,

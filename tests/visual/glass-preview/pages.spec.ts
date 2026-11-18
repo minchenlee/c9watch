@@ -139,7 +139,7 @@ test.describe('glass 今天 / 用量 / 設定 (not a baseline)', () => {
 		});
 	}
 
-	test('設定: shell, glass mode, fee, extensions, rules preview (fixture)', async ({ page }) => {
+	test('設定: shell, glass mode, fee, rules preview (fixture)', async ({ page }) => {
 		await page.setViewportSize({ width: 1100, height: 1300 });
 		await openClassic(page, { path: '/#/settings', storage: glass });
 		const s = page.locator('[data-settings]');
@@ -148,8 +148,6 @@ test.describe('glass 今天 / 用量 / 設定 (not a baseline)', () => {
 		await expect(s.locator('.rule')).toHaveCount(1);
 		await expect(s.locator('.rule button')).toBeDisabled();
 		await expect(s.locator('[data-rearrange]')).toBeDisabled();
-		await expect(s.locator('[data-table="extensions"]')).toHaveCount(0);
-		await expect(s.getByText('沒有安裝 extension')).toBeVisible();
 		await ready(page);
 		await page.screenshot({ path: out('g10-settings'), fullPage: true });
 

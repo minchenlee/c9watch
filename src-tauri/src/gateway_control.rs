@@ -1,5 +1,5 @@
 //! Native gateway control. Neither signing keys nor grants reach the webview.
-//! Wire encoding is documented in docs/api/gui-gateway-bridge.md for M-b integration.
+//! Wire encoding: see `c9watch_core::gateway`.
 use crate::{
     bridge::Bridge,
     engine_proto::{confirmation, spawn::EngineConn},

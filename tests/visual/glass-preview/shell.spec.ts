@@ -55,7 +55,6 @@ test.describe('glass preview (not a baseline)', () => {
 		await expect(side.getByText('lead-terms', { exact: true })).toBeVisible();
 		await expect(side.getByText('對談 · main', { exact: true })).toBeVisible();
 		await expect(side.getByText('辦公室平面圖')).toHaveCount(0);
-		await expect(side.locator('[data-slot="extensions"]')).toBeEmpty();
 		await shot(page, 'g1-sidebar-open');
 	});
 

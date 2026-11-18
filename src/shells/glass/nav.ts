@@ -8,19 +8,17 @@ export type GlassRoute =
     | { page: 'today' }
     | { page: 'usage' }
     | { page: 'settings' }
-    | { page: 'ws'; id: string }
-    | { page: 'ext'; extId: string; pageId: string };
+    | { page: 'ws'; id: string };
 
 export const DEFAULT_ROUTE: GlassRoute = { page: 'needs' };
 
-/** Parses `#/needs`, `#/ws/<id>`, `#/ext/<extId>/<pageId>`, ...
+/** Parses `#/needs`, `#/ws/<id>`, ...
  * Anything else is the default page. */
 export function parseHash(hash: string): GlassRoute {
     const parts = hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
-    const [page, a, b] = parts;
+    const [page, a] = parts;
     if ((page === 'needs' || page === 'today' || page === 'usage' || page === 'settings') && parts.length === 1) return { page };
     if (page === 'ws' && a && parts.length === 2) return { page, id: a };
-    if (page === 'ext' && a && b && parts.length === 3) return { page, extId: a, pageId: b };
     return DEFAULT_ROUTE;
 }
 
@@ -28,7 +26,6 @@ export function routeHash(route: GlassRoute): string {
     const e = encodeURIComponent;
     switch (route.page) {
         case 'ws': return `#/ws/${e(route.id)}`;
-        case 'ext': return `#/ext/${e(route.extId)}/${e(route.pageId)}`;
         default: return `#/${route.page}`;
     }
 }

@@ -17,7 +17,7 @@ Rules:
   It never imports Classic components or `$lib/stores/*`.
 - Glass starts its own feeds (`data.ts`); Classic's `(app)/+layout.svelte` does not run.
 - Pages are URL hashes (`nav.ts`): `#/needs`, `#/today`, `#/ws/<id>`,
-  `#/ext/<extId>/<pageId>`, `#/usage`, `#/settings`.
+  `#/usage`, `#/settings`.
 
 Demo data: one fixture in c9p shapes, `src/lib/data/demo/glass.ts`, on when
 `demoMode = 'true'` and `c9watch.demoGlass = '1'`. Data that c9p does not have yet
@@ -46,7 +46,7 @@ G1 frame:
   keys with `usePageKeys`; a receipt page passes `receipt: true`.
   `scripts/test-glass-keys.mjs` covers text fields, IME and receipts.
 - `Sidebar.svelte`: 需要你 → 今天 → workspaces (lead and talk rows) →
-  extension pages → 用量 / 設定. `[` collapses it to a
+  用量 / 設定. `[` collapses it to a
   「需要你 · N」 button. ⌘N shows a `c9watch spawn` hint (no delegate in v1).
 
 G3 workspace page (`#/ws/<id>`, `pages/Workspace.svelte`):
@@ -126,29 +126,6 @@ G5 actions (`handling/actions.ts`, pure, `scripts/test-glass-handling.mjs`):
   same text between two polls is hidden like the handled one.
 - `tests/glass/needs.spec.ts`: the 7 handoff §3 interaction tests.
 
-G6 extension host (`ext/`, glass build plan §3, manifest per owner D41 R1–R12):
-
-- `manifest.ts`: validates `c9ext.json` (strict JSON, `c9ext: 1`,
-  `ui.contract: "c9ui/1"`, id = directory name, ≤ 64 KiB, ≤ 16 pages).
-  Status: `ok` / `manifest_error` / `version_mismatch` / `shadowed` /
-  `dev_only`. The `core` block is never run. Tests: `scripts/test-glass-ext.mjs`.
-- `registry.ts`: Tauri asks `localCommand('ext_list')` (G7; until then the
-  list is empty), `vite dev` asks `/c9ext/_list`
-  (`scripts/vite-c9ext-dev.mjs`: repo `extensions/` first, then
-  `$C9WATCH_ENGINE_HOME/extensions/`). Both send raw manifest text
-  (`ExtCandidate`); the host validates.
-- `ExtPages.svelte` + `Mount.svelte`: `import()` the page entry into a
-  shadow root, `mount(root, host)`; 5 s without `ready()` shows
-  「extension 沒有回應」, a throw shows 「extension 停止了」. The timeout
-  covers async hangs only: a synchronous loop freezes the window, the same
-  as any trusted npm package (D31: same document, no iframe or worker). The last page
-  stays mounted (`suspend` / `resume`). On an extension page J / K step
-  `context.needsItemId` through the needs queue.
-- Keys: a key from inside an extension goes to the extension first, except
-  ⌘K, ⌘N and Esc; it sends unused keys back with `host.keys.forward`.
-- `extensions/hello/` is `dev: true`: dev builds only. Tests:
-  `npx playwright test -c tests/glass/playwright.config.ts` (vite dev, port 4181).
-
 G10a 今天 / 用量 / 設定 (host pages, `pages/`):
 
 - `Today.svelte` + `today-model.ts` (pure): 需要你 is one line
@@ -181,7 +158,7 @@ G10a 今天 / 用量 / 設定 (host pages, `pages/`):
 - `Settings.svelte`: Shell (glass → Classic asks first; the way back is
   Classic's SETTINGS › About & updates › Interface, D42), Glass Off / Subtle / Full (`ui.glass`, sets
   `data-glass`; native vibrancy is G10b), monthly fee, 重新排列房間 (off
-  until the office extension), Extensions (read-only, from `ext/registry`),
+  until the office extension),
   規則與授權 (shell only; the fixture shows the 允許 rule as
   「設計預覽，不會儲存」).
 - Tests: `scripts/test-glass-pages.mjs`,
