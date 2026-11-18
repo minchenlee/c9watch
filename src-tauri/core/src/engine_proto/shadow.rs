@@ -185,7 +185,7 @@ pub struct ShadowDiff {
     /// Per socket operation; `ENGINE_TIMEOUT` outside tests.
     timeout: Duration,
     /// `(session key, field)` → compared ticks in a row it differed.
-    #[cfg(any(feature = "gui", feature = "engine"))]
+    #[cfg(feature = "gui")]
     field_streaks: HashMap<(String, String), u32>,
 }
 
@@ -210,7 +210,7 @@ impl ShadowDiff {
             last_flush: None,
             last_error: None,
             timeout: ENGINE_TIMEOUT,
-            #[cfg(any(feature = "gui", feature = "engine"))]
+            #[cfg(feature = "gui")]
             field_streaks: HashMap::new(),
         }
     }
@@ -232,7 +232,7 @@ impl ShadowDiff {
 
     /// One GUI poll after the workers overlay: compare each session's
     /// fields with the engine's `session.views`.
-    #[cfg(any(feature = "gui", feature = "engine"))]
+    #[cfg(feature = "gui")]
     pub fn tick_views(&mut self, sessions: &[Session]) {
         let gui: Vec<serde_json::Value> = sessions
             .iter()
@@ -247,7 +247,7 @@ impl ShadowDiff {
     /// Count one field comparison. `engine` is `None` when the engine could
     /// not be read; the slack starts over after it. Returns the field diffs
     /// written to the diff file this tick.
-    #[cfg(any(feature = "gui", feature = "engine"))]
+    #[cfg(feature = "gui")]
     pub fn record_fields(
         &mut self,
         day: &str,
@@ -406,7 +406,7 @@ impl ShadowDiff {
 }
 
 /// How a session field is compared.
-#[cfg(any(feature = "gui", feature = "engine"))]
+#[cfg(feature = "gui")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rule {
@@ -418,7 +418,7 @@ pub enum Rule {
     Text,
 }
 
-#[cfg(any(feature = "gui", feature = "engine"))]
+#[cfg(feature = "gui")]
 impl Rule {
     /// Field names are the GUI's camelCase `Session` keys.
     pub fn of(field: &str) -> Rule {
@@ -448,7 +448,7 @@ impl Rule {
 /// One field that differs between the GUI's session and the engine's view.
 /// `gui` and `engine` are what a diff row holds: a number, `null`, or the
 /// SHA-256 of the value's JSON.
-#[cfg(any(feature = "gui", feature = "engine"))]
+#[cfg(feature = "gui")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldDiff {
     pub key: String,
@@ -458,7 +458,7 @@ pub struct FieldDiff {
     pub engine: serde_json::Value,
 }
 
-#[cfg(any(feature = "gui", feature = "engine"))]
+#[cfg(feature = "gui")]
 impl FieldDiff {
     fn row(&self, day: &str, ts_ms: i64) -> serde_json::Value {
         serde_json::json!({
@@ -477,7 +477,7 @@ impl FieldDiff {
 /// A value as a diff row may hold it: numbers and `null` as they are,
 /// anything else (strings, flags, lists, objects) as the SHA-256 of its
 /// JSON, so no text reaches the file.
-#[cfg(any(feature = "gui", feature = "engine"))]
+#[cfg(feature = "gui")]
 pub fn fingerprint(v: &serde_json::Value) -> serde_json::Value {
     use sha2::{Digest, Sha256};
     match v {
@@ -492,7 +492,7 @@ pub fn fingerprint(v: &serde_json::Value) -> serde_json::Value {
 
 /// The field diffs of the sessions both sides have, by `sessionKey`, in a
 /// stable order. A session on one side only is the presence diff's job.
-#[cfg(any(feature = "gui", feature = "engine"))]
+#[cfg(feature = "gui")]
 pub fn compare_fields(gui: &[serde_json::Value], engine: &[serde_json::Value]) -> Vec<FieldDiff> {
     let by_key = |vs: &[serde_json::Value]| -> std::collections::BTreeMap<
         String,
@@ -839,7 +839,7 @@ mod tests {
 
     // ── Field diff (core-public M-a2) ─────────────────────────────────
 
-    #[cfg(any(feature = "gui", feature = "engine"))]
+    #[cfg(feature = "gui")]
     fn view(key: &str, status: &str, first: &str, count: u64) -> serde_json::Value {
         serde_json::json!({
             "sessionKey": key, "status": status, "firstPrompt": first,
@@ -849,7 +849,7 @@ mod tests {
 
     /// Rules: a stable or text diff is written on its second tick, a
     /// volatile one on its third; each once; the coverage counts them.
-    #[cfg(any(feature = "gui", feature = "engine"))]
+    #[cfg(feature = "gui")]
     #[test]
     fn field_diffs_obey_their_slack_and_are_written_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -900,7 +900,7 @@ mod tests {
 
     /// A diff that clears within its slack is never written; an unreachable
     /// tick starts the slack over.
-    #[cfg(any(feature = "gui", feature = "engine"))]
+    #[cfg(feature = "gui")]
     #[test]
     fn field_diffs_within_slack_or_across_a_gap_are_explained() {
         let dir = tempfile::tempdir().unwrap();
@@ -927,7 +927,7 @@ mod tests {
         assert!(!dir.path().join(DIFF_FILE).exists());
     }
 
-    #[cfg(any(feature = "gui", feature = "engine"))]
+    #[cfg(feature = "gui")]
     #[test]
     fn tick_views_reads_a_running_engine() {
         let dir = tempfile::tempdir().unwrap();

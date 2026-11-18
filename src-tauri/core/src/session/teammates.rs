@@ -68,7 +68,6 @@ struct Stamp {
 }
 
 /// The link from a teammate session to its team and lead.
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TeammateLink {

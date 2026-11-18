@@ -6,7 +6,6 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Conversation structure
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
@@ -29,7 +28,6 @@ pub struct ConversationProgress {
 }
 
 /// Individual message in a conversation
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationMessage {

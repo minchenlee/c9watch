@@ -87,13 +87,6 @@ fi
 cp "$DOWNLOAD_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
 chmod +x "$INSTALL_DIR/$BINARY_NAME"
 
-# Linux core archives ship the pair. Older releases and macOS CLI-only
-# archives still install normally without an agent binary.
-if [ -f "$DOWNLOAD_DIR/c9watch-agent" ]; then
-  cp "$DOWNLOAD_DIR/c9watch-agent" "$INSTALL_DIR/c9watch-agent"
-  chmod +x "$INSTALL_DIR/c9watch-agent"
-fi
-
 # --- Verify ---
 
 echo ""

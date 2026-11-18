@@ -21,7 +21,6 @@ pub const MAX_FRAME: usize = 1 << 20;
 /// A request frame. Every field is optional on the wire, so that a frame
 /// with a missing field still gets an error that echoes its `id`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v: Option<u32>,
@@ -37,7 +36,6 @@ pub struct Request {
 
 /// A response frame: `ok:true` with `result`, or `ok:false` with `error`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct Response {
     pub v: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,7 +76,6 @@ impl Response {
 
 /// The `error` object of a failed response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct ErrorBody {
     pub code: ErrorCode,
     pub msg: String,
@@ -93,7 +90,6 @@ pub struct ErrorBody {
 /// Typed error codes. New codes are additive; a client that does not know a
 /// code still has `msg`, `retryable` and `hint`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// The client speaks another major version.
@@ -354,7 +350,6 @@ impl From<ApiError> for ErrorBody {
 /// `hello` params. `client` is the caller's own claim. The engine only logs
 /// it as unverified; it never decides the principal.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HelloParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -372,7 +367,6 @@ pub struct HelloParams {
 
 /// What a client says about itself in `hello`. Unverified.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct ClientInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
@@ -384,7 +378,6 @@ pub struct ClientInfo {
 
 /// `hello` result.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HelloResult {
     pub api_major: u32,
@@ -415,7 +408,6 @@ pub struct HelloResult {
 
 /// One method in `hello.result.methods`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct MethodInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs: Option<AuthNeeds>,
@@ -429,7 +421,6 @@ pub struct MethodInfo {
 
 /// A sensitivity ceiling. Ordering is also the egress ordering.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Ceiling {
     Public,
@@ -440,7 +431,6 @@ pub enum Ceiling {
 
 /// Additional authority a caller would need.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AuthNeeds {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -453,7 +443,6 @@ pub struct AuthNeeds {
 
 /// Ask about the caller's own authority. Params are inspected, never executed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AuthCanParams {
     pub method: String,
     #[serde(default)]
@@ -461,7 +450,6 @@ pub struct AuthCanParams {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AuthCanResult {
     pub allowed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -471,7 +459,6 @@ pub struct AuthCanResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AuthRulesResult {
     pub principal: String,
@@ -487,7 +474,6 @@ pub struct AuthRulesResult {
 
 /// The engine's limits, in `hello.result.limits`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Limits {
     /// Bytes in one frame, newline included.
@@ -504,14 +490,12 @@ pub struct Limits {
 
 /// `events.unsubscribe` params: the `id` of the `events.subscribe` request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct UnsubscribeParams {
     pub sub: String,
 }
 
 /// `events.unsubscribe` result. No event frame of the stream follows it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct UnsubscribeResult {
     /// `false` when the connection held no stream with that `sub`.
     pub ended: bool,
@@ -519,12 +503,10 @@ pub struct UnsubscribeResult {
 
 /// `ping` params. There are none.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct PingParams {}
 
 /// `ping` result: the engine's clock.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct PingResult {
     /// Unix milliseconds.
     pub ts: i64,
@@ -533,13 +515,11 @@ pub struct PingResult {
 /// `snapshot.get` params. There are none yet; the engine ignores any it
 /// gets.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct SnapshotParams {}
 
 /// `snapshot.get` result: the state and the cursor it is consistent with.
 /// Subscribing with `since` = `cursor` continues with no gap.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotResult {
     pub cursor: String,
@@ -560,7 +540,6 @@ pub struct SnapshotResult {
 /// One row of the `agents` table, as `snapshot.get`,
 /// `session.list` and `agent.list` send it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRow {
     /// `agt_<ulid>`.
@@ -656,7 +635,6 @@ pub struct AgentRow {
 /// `denyWriteUnder` directory are refused, except under an `allowWrite`
 /// subtree. Bash is not fenced here; the CC sandbox keeps it in the cwd.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentGuard {
     /// Absolute existing directories, not `/`. At most 64.
@@ -672,7 +650,6 @@ pub struct AgentGuard {
 /// text. Nothing here can allow a tool, a path, a hook, an env var or an
 /// MCP server. Unknown fields are refused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentOverlay {
     /// The Claude Code `--model`: 1 to 64 of letters, digits, `.`, `_`,
@@ -706,13 +683,11 @@ pub struct AgentOverlay {
 /// `session.list` params. There are none yet; the engine ignores any it
 /// gets.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct SessionListParams {}
 
 /// `session.list` result: the agents whose session detection sees now
 /// (`goneAt` is `null`), in creation order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionListResult {
     pub sessions: Vec<AgentRow>,
@@ -727,7 +702,6 @@ pub struct SessionListResult {
 /// `session.views` params. There are none yet; the engine ignores any it
 /// gets.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct SessionViewsParams {}
 
 /// `session.views` result: the sessions of the last detection tick, as the
@@ -736,7 +710,6 @@ pub struct SessionViewsParams {}
 /// no gap: `session.view` carries a new or changed session in full,
 /// `session.gone` (`SessionGoneEvent`) one that ended.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct SessionViewsResult {
     pub cursor: String,
     pub sessions: Vec<SessionView>,
@@ -744,7 +717,6 @@ pub struct SessionViewsResult {
 
 /// `session.gone` data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionGoneEvent {
     /// `<provider>:<session id>`.
@@ -759,7 +731,6 @@ pub struct SessionGoneEvent {
 /// this says how old that is. While passes are written, `detect.health`
 /// repeats every `staleAfterMs / 2` with a newer `lastOkAt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct DetectorHealth {
     /// `ok`: the last pass was written. `degraded`: it was written, but
@@ -790,7 +761,6 @@ pub struct DetectorHealth {
 
 /// `agent.attention` data: an agent needs the user.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAttentionEvent {
     pub id: String,
@@ -807,7 +777,6 @@ pub struct AgentAttentionEvent {
 
 /// `agent.turn_end` data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentTurnEndEvent {
     pub id: String,
     pub generation: i64,
@@ -819,7 +788,6 @@ pub struct AgentTurnEndEvent {
 
 /// `agent.gone` data: the session behind an observed agent ended.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentGoneEvent {
     pub id: String,
@@ -830,7 +798,6 @@ pub struct AgentGoneEvent {
 
 /// `agent.failed` data: a managed agent could not be started or kept.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentFailedEvent {
     pub id: String,
     pub reason: String,
@@ -840,7 +807,6 @@ pub struct AgentFailedEvent {
 /// `notification.needs_attention` and `notification.waiting_for_input`
 /// data: what the GUI shows in its system notification.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationEvent {
     /// The agent id of the session.
@@ -862,7 +828,6 @@ pub struct NotificationEvent {
 
 /// `legacy.inbox` data: one imported worker inbox line, as it was.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct LegacyInboxEvent {
     pub legacy: bool,
     /// The worker's agent id, when the import found its row.
@@ -873,7 +838,6 @@ pub struct LegacyInboxEvent {
 
 /// `session.away` params: one request per session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct SessionAwayParams {
     #[serde(default)]
     pub requests: Vec<crate::session::away::AwayRequest>,
@@ -883,7 +847,6 @@ pub struct SessionAwayParams {
 /// keyed by session key. A session without an index (not Claude Code, or
 /// not seen by a detection tick yet) is absent.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct SessionAwayResult {
     pub activity: std::collections::HashMap<String, crate::session::away::AwayActivity>,
 }
@@ -891,14 +854,12 @@ pub struct SessionAwayResult {
 /// `detect.recheck` params. There are none yet; the engine ignores any it
 /// gets.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct DetectRecheckParams {}
 
 /// `detect.recheck`, `session.stop` and `session.rename` result. The call
 /// ran one detection tick before it answered: its `session.view` and
 /// `session.gone` events are at or before `cursor`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TickResult {
     pub cursor: String,
@@ -909,7 +870,6 @@ pub struct TickResult {
 /// `session.stop` params: stop an observed Claude Code session with
 /// SIGTERM. The pid comes from the engine's own detection.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStopParams {
     /// `<provider>:<session id>`.
@@ -921,7 +881,6 @@ pub struct SessionStopParams {
 
 /// `session.rename` params: set a Claude Code session's custom title.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRenameParams {
     /// The provider session id.
@@ -936,7 +895,6 @@ pub struct SessionRenameParams {
 /// `conversation.get` params: one session's transcript, as the GUI's
 /// `get_conversation` reads it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationGetParams {
     /// `<provider>:<session id>`. A bare session id (no known provider
@@ -969,7 +927,6 @@ pub const PAGE_BUDGET: usize = MAX_FRAME / 2;
 /// its own comes alone, with its large text replaced by a short note and
 /// `truncated: true`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PageParams {
     #[serde(default)]
@@ -977,7 +934,6 @@ pub struct PageParams {
     /// At most this many items. Default 200; a value over 1000 is treated
     /// as 1000; 0 is `bad_request`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "engine", schemars(range(min = 1)))]
     pub limit: Option<usize>,
 }
 
@@ -985,7 +941,6 @@ pub struct PageParams {
 /// transcript order (see `PageParams` for the page size). Each call reads
 /// the transcript again.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationGetResult {
     pub session_id: String,
@@ -1003,7 +958,6 @@ pub struct ConversationGetResult {
 /// before that request's response. Never stored; a slow client may miss
 /// some.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ProgressFrame {
     pub v: u32,
@@ -1017,7 +971,6 @@ pub struct ProgressFrame {
 
 /// The `type` of a progress frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub enum ProgressType {
     #[serde(rename = "progress")]
     Progress,
@@ -1025,7 +978,6 @@ pub enum ProgressType {
 
 /// `history.list` params.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryListParams {
     /// Without it, the first page (`offset` 0, the default `limit`).
@@ -1036,7 +988,6 @@ pub struct HistoryListParams {
 /// `history.list` result: one page of past sessions of every provider,
 /// newest first, as the GUI's `get_session_history` lists them.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryListResult {
     pub entries: Vec<crate::session::HistoryEntry>,
@@ -1049,7 +1000,6 @@ pub struct HistoryListResult {
 
 /// `history.search` params: a phrase search over Claude Code transcripts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HistorySearchParams {
     pub query: String,
@@ -1062,19 +1012,16 @@ pub struct HistorySearchParams {
 /// `history.search` result: one hit per matching session. A blank query
 /// has none.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct HistorySearchResult {
     pub hits: Vec<crate::session::DeepSearchHit>,
 }
 
 /// `cost.get` params. There are none yet.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct CostGetParams {}
 
 /// `memory.list` params.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryListParams {
     /// Without it, the first page (`offset` 0, the default `limit`).
@@ -1085,7 +1032,6 @@ pub struct MemoryListParams {
 /// `memory.list` result: one page of memory files grouped by project, as
 /// the GUI's `get_memory_files` reads them. A page item is a project.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryListResult {
     pub projects: Vec<crate::session::ProjectMemory>,
@@ -1099,7 +1045,6 @@ pub struct MemoryListResult {
 /// `subagent.list` params: the raw Claude Code session ids the caller
 /// shows (not session keys).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentListParams {
     #[serde(default)]
@@ -1108,14 +1053,12 @@ pub struct SubagentListParams {
 
 /// `subagent.list` result: parent session id → its subagent invocations.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct SubagentListResult {
     pub subagents: std::collections::HashMap<String, Vec<crate::session::subagents::SubagentInfo>>,
 }
 
 /// `subagent.transcript` params.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentTranscriptParams {
     pub parent_session_id: String,
@@ -1125,7 +1068,6 @@ pub struct SubagentTranscriptParams {
 
 /// `session.tasks` params.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionTasksParams {
     /// The raw Claude Code session id.
@@ -1135,34 +1077,29 @@ pub struct SessionTasksParams {
 /// `session.tasks` result: the session's TodoWrite tasks as Claude Code
 /// wrote them, sorted by numeric `id`.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct SessionTasksResult {
     pub tasks: Vec<serde_json::Value>,
 }
 
 /// `usage.subscriptions` params. There are none yet.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct UsageSubscriptionsParams {}
 
 /// `usage.subscriptions` result: one snapshot per provider plan. The
 /// engine reads the providers at most once a minute.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct UsageSubscriptionsResult {
     pub usage: Vec<crate::session::subscription_usage::SubscriptionUsage>,
 }
 
 /// `provider.opencode.status` params. There are none yet.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct OpencodeStatusParams {}
 
 /// `provider.opencode.connect` params: the OpenCode server detection
 /// reads. An empty `url` disconnects. The engine keeps the credentials in
 /// memory only and never returns them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OpencodeConnectParams {
     pub url: String,
@@ -1174,12 +1111,10 @@ pub struct OpencodeConnectParams {
 
 /// `diag.detection` params. There are none yet.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct DiagDetectionParams {}
 
 /// `agent.list` params.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentListParams {
     /// Also return gone, retired and failed agents (tombstones included).
     #[serde(default)]
@@ -1188,7 +1123,6 @@ pub struct AgentListParams {
 
 /// `agent.list` result, in creation order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentListResult {
     pub agents: Vec<AgentRow>,
 }
@@ -1196,7 +1130,6 @@ pub struct AgentListResult {
 /// `agent.create` params. Only free agents are supported: no brief,
 /// no worktree, the given cwd.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCreateParams {
     /// The adapter kind. Only `claude` is supported.
@@ -1236,14 +1169,12 @@ fn default_kind() -> String {
 
 /// `agent.create` result: the agent once it is `ready`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentCreateResult {
     pub agent: AgentRow,
 }
 
 /// `agent.retire` params.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentRetireParams {
     /// The agent id (`agt_<ulid>`).
     pub id: String,
@@ -1261,14 +1192,12 @@ pub struct AgentRetireParams {
 /// be confirmed, the row is `orphaned` instead; retire it again to retry
 /// the kill.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentRetireResult {
     pub agent: AgentRow,
 }
 
 /// `agent.resume` params.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentResumeParams {
     /// The agent id (`agt_<ulid>`) of a `paused` or `interrupted` engine
     /// agent.
@@ -1277,7 +1206,6 @@ pub struct AgentResumeParams {
 
 /// `agent.resume` result: the agent once it is `ready`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentResumeResult {
     pub agent: AgentRow,
 }
@@ -1285,7 +1213,6 @@ pub struct AgentResumeResult {
 /// What a message asks of its reader. A caller sends `request` or
 /// `info`; `result` and `system` are written by the engine.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MsgKind {
     Request,
@@ -1309,7 +1236,6 @@ impl MsgKind {
 /// `msg.send` params. The envelope's `idem` makes a resend safe: the same
 /// sender, key and request get the first message back.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MsgSendParams {
     /// An agent id (`agt_<ulid>`), a name, or `<machine>/<id>` with this
@@ -1327,7 +1253,6 @@ pub struct MsgSendParams {
 
 /// The agent a message went to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MsgAddress {
     pub id: String,
@@ -1338,7 +1263,6 @@ pub struct MsgAddress {
 
 /// `msg.send` result. The response's `seq` is the same cursor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MsgSendResult {
     /// `msg_<ulid>`.
@@ -1359,7 +1283,6 @@ pub struct MsgSendResult {
 /// `data` of a `msg.state` event: one per state change of a message. The
 /// event's subject is the target's `<machine>/<id>`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MsgStateEvent {
     pub msg_id: String,
@@ -1394,7 +1317,6 @@ pub struct MsgStateEvent {
 
 /// `events.subscribe` params. Empty filters match everything.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SubscribeParams {
     /// The last cursor the client has seen. Without it, the stream starts at
@@ -1414,7 +1336,6 @@ pub struct SubscribeParams {
 /// the subscribe request's `id` (`cursor_expired` when the subscriber fell
 /// behind retention).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SubscribeResult {
     /// Where the stream starts: events after this cursor follow.
@@ -1424,7 +1345,6 @@ pub struct SubscribeResult {
 /// One event on the wire. `sub` is the `id` of the subscribe
 /// request, so a connection can carry several subscriptions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct EventFrame {
     pub v: u32,
     #[serde(rename = "type")]
@@ -1444,7 +1364,6 @@ pub struct EventFrame {
 /// The `type` of an event frame. A response frame has no `type`, so a
 /// client tells the two apart by `type === "event"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub enum EventType {
     #[serde(rename = "event")]
     Event,
@@ -1472,7 +1391,6 @@ pub fn is_hook_class(method: &str) -> bool {
 /// `hook.*` params: one Claude Code hook event, sent by `c9watch-agent
 /// hook <event>`. The engine alone writes the log.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HookParams {
     /// `C9_AGENT_ID` of the sender. It must be the agent the engine stamped.
@@ -1493,7 +1411,6 @@ pub struct HookParams {
 
 /// `hook.*` result.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HookResult {
     /// The engine took the event. A dropped event (an old generation, a
@@ -1508,7 +1425,6 @@ pub struct HookResult {
 /// `hook.pre_tool_use` result: whether a fenced agent's file tool call
 /// may run. The hook blocks the call (exit 2) on `deny` and on no answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PreToolUseResult {
     /// `allow` or `deny`.
@@ -1520,7 +1436,6 @@ pub struct PreToolUseResult {
 
 /// `task.done` params (`c9watch-agent task done --report`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDoneParams {
     /// `C9_AGENT_ID` of the sender.
@@ -1533,7 +1448,6 @@ pub struct TaskDoneParams {
 /// `task.done` result. Free agents have no task, so the call fails with
 /// `no_task` instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDoneResult {
     pub task_id: String,
@@ -1542,7 +1456,6 @@ pub struct TaskDoneResult {
 /// `agent.handoff` params (`c9watch-agent handoff --note -`). The wire
 /// format is reserved; the engine currently answers `unsupported`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffParams {
     /// `C9_AGENT_ID` of the sender.
@@ -1555,7 +1468,6 @@ pub struct HandoffParams {
 
 /// `agent.handoff` result (reserved).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffResult {
     pub accepted: bool,
@@ -1563,7 +1475,6 @@ pub struct HandoffResult {
 
 /// Mailbox query. Reads never mark a message read by the model.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MsgListParams {
     pub agent: Option<String>,
@@ -1572,19 +1483,16 @@ pub struct MsgListParams {
     pub limit: Option<usize>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MsgIdParams {
     pub msg_id: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct MailAgentParams {
     pub agent: String,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MsgFrom {
     pub kind: String,
@@ -1592,7 +1500,6 @@ pub struct MsgFrom {
     pub name: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MsgSummary {
     pub msg_id: String,
@@ -1611,20 +1518,17 @@ pub struct MsgSummary {
     pub preview: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct MsgListResult {
     pub items: Vec<MsgSummary>,
     pub next: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct MsgStatus {
     pub state: String,
     pub at: i64,
     pub detail: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct MsgReadResult {
     #[serde(flatten)]
     pub summary: MsgSummary,
@@ -1634,7 +1538,6 @@ pub struct MsgReadResult {
     pub status: Vec<MsgStatus>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct MailControlResult {
     pub ok: bool,
 }

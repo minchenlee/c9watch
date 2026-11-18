@@ -6,7 +6,6 @@ use std::path::Path;
 const CODEX_MEMORY_FILES: [&str; 2] = ["MEMORY.md", "memory_summary.md"];
 
 /// A single memory file (e.g., MEMORY.md, profile.md)
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryFile {
@@ -19,7 +18,6 @@ pub struct MemoryFile {
 }
 
 /// All memory files for a single project
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectMemory {

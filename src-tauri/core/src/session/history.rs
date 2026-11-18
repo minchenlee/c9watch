@@ -18,7 +18,6 @@ struct RawHistoryLine {
 }
 
 /// A deduplicated, enriched history entry returned to the frontend
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
@@ -212,7 +211,6 @@ pub(crate) fn filter_and_enrich(
 }
 
 /// A single deep-search hit: session ID + first matching snippet (truncated).
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepSearchHit {

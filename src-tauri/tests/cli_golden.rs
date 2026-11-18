@@ -72,14 +72,9 @@ impl Golden {
         }
     }
 
-    /// `args` with `--direct` after the subcommand in an engine build.
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut args: Vec<&str> = args.to_vec();
-        if cfg!(feature = "engine") {
-            args.insert(1, "--direct");
-        }
         let mut c = Command::new(BIN);
-        c.args(&args)
+        c.args(args)
             .env_clear()
             .env("HOME", self.root.join("h"))
             .env(

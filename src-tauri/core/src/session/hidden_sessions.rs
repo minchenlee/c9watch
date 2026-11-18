@@ -18,7 +18,6 @@ const CHILD_SESSION_VAR: &str = "CLAUDE_CODE_CHILD_SESSION";
 /// Pid of the Claude Code process that launched the app.
 const PARENT_PID_VAR: &str = "CLAUDE_PID";
 
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum HiddenReason {
@@ -27,7 +26,6 @@ pub enum HiddenReason {
     ChildSessionMarker,
 }
 
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct HiddenClaudeSession {

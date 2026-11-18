@@ -56,9 +56,6 @@ jobs:
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      - name: GUI with core integration tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --features engine
-
       - name: Build frontend
         run: npm run build
 
@@ -71,11 +68,6 @@ jobs:
         run: |
           cargo test --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features cli
-
-      - name: Engine feature tests
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features engine
 
   visual-classic:
     # Classic must stay pixel-identical (core-public plan, M-c0). Fixed
@@ -180,9 +172,9 @@ jobs:
         run: cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
 
       - name: Core has no tauri (D32)
-        # The core crate (engine, CLI) and c9watch-agent never depend on
-        # tauri, with any feature, on any target. Package names only: the
-        # path `src-tauri/core` itself contains "tauri".
+        # The core crate (session readers, CLI) never depends on tauri, with
+        # any feature, on any target. Package names only: the path
+        # `src-tauri/core` itself contains "tauri".
         run: |
           set -euo pipefail
           # Fails the step when cargo fails, even after partial output:
@@ -197,28 +189,25 @@ jobs:
           gui=$(names c9watch)
           grep -qx c9watch <<<"$gui"
           grep -qx tauri <<<"$gui"
-          for p in c9watch-core c9watch-agent; do
-            list=$(names "$p")
-            grep -qx "$p" <<<"$list"
-            if grep -i '^tauri' <<<"$list"; then
-              echo "::error::$p depends on tauri"
-              exit 1
-            fi
-            echo "$p: no tauri crate in $(wc -l <<<"$list") packages"
-          done
+          list=$(names c9watch-core)
+          grep -qx c9watch-core <<<"$list"
+          if grep -i '^tauri' <<<"$list"; then
+            echo "::error::c9watch-core depends on tauri"
+            exit 1
+          fi
+          echo "c9watch-core: no tauri crate in $(wc -l <<<"$list") packages"
 
-      - name: Core and agent build on their own (D32)
-        # Workspace commands unify features across the three packages, so
-        # they can hide a dependency that only another package turns on.
+      - name: Core builds on its own (D32)
+        # Workspace commands unify features across packages, so they can
+        # hide a dependency that only another package turns on.
         run: |
           set -euo pipefail
           m=src-tauri/Cargo.toml
-          for f in "" gui cli engine gateway-assets; do
+          for f in "" gui cli gateway-assets; do
             echo "c9watch-core features: ${f:-none}"
             cargo check --manifest-path "$m" -p c9watch-core --features "$f"
           done
           cargo check --manifest-path "$m" -p c9watch-core --all-features
-          cargo check --manifest-path "$m" -p c9watch-agent --features engine
 
       - name: Prod channel build check
         # CI builds are dev channel by default. Check the prod cfg path too.
@@ -226,69 +215,21 @@ jobs:
           C9WATCH_CHANNEL: prod
         run: |
           cargo check --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features engine
-
-      - name: Prod channel has no shadow diff
-        # C1a-17: the dev-only shadow diff and `engine shadow-report` are
-        # not compiled into a prod channel build. Exact names, and both must
-        # run: a renamed or cfg'd-out test fails the step, not skips it.
-        env:
-          C9WATCH_CHANNEL: prod
-        run: |
-          out=$(cargo test --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features engine --lib -- --exact \
-            engine_proto::channel_tests::prod_channel_build_has_no_shadow_diff \
-            cli::dispatch_tests::shadow_report_only_in_dev_builds)
-          echo "$out"
-          echo "$out" | grep -q "test result: ok. 2 passed"
+            --no-default-features --features cli
 
       - name: CLI-only tests
         run: |
           cargo test --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features cli
 
-      - name: Engine feature tests
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features engine
-
-      - name: Live-test build check
-        # The test-only `live-test` feature (tests/live/*.sh) is never
-        # shipped and the scripts need a real claude. Only check that it
-        # still compiles.
-        run: |
-          cargo check --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features engine,live-test
-
-      - name: Crash reconcile test (X9)
-        # Uses the live-test crash failpoint with a fake claude, so it
-        # runs in CI.
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features engine,live-test \
-            --test engine_cli an_engine_killed
-
-      - name: Agent binary and default run target
-        # C1a-21: Linux builds c9watch-agent by name, and `cargo run` with
-        # two binaries still picks c9watch (`default-run`).
-        run: |
-          cargo build --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features engine --bin c9watch-agent
-          out=$(cargo run --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features engine -- --version)
-          echo "$out"
-          echo "$out" | grep -q '^c9watch '
-
-      - name: Build and smoke-test Linux core tarball
+      - name: Build and smoke-test Linux CLI tarball
         env:
           C9WATCH_CHANNEL: prod
         run: |
           cargo build --release --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features engine,cli --bins
+            --no-default-features --features cli --bins
           stage=$(mktemp -d)
-          tar -czf "$stage/c9watch-linux.tar.gz" -C src-tauri/target/release c9watch c9watch-agent
+          tar -czf "$stage/c9watch-linux.tar.gz" -C src-tauri/target/release c9watch
           mkdir "$stage/unpacked"
           tar -xzf "$stage/c9watch-linux.tar.gz" -C "$stage/unpacked"
           "$stage/unpacked/c9watch" --version
-          "$stage/unpacked/c9watch" engine --help
-          "$stage/unpacked/c9watch-agent" --help

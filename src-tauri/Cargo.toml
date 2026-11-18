@@ -1,12 +1,10 @@
-# The workspace (D32): `core` is the c9watch core (engine, CLI, session
-# readers) and never depends on tauri; `agent` is `c9watch-agent`; this
-# package is the Tauri GUI shell and the `c9watch` binary. Without `gui`
+# The workspace (D32): `core` is the c9watch core (CLI, session readers)
+# and never depends on tauri; this package is the Tauri GUI shell and the
+# `c9watch` binary. Without `gui`
 # the binary is the CLI over the core.
 [workspace]
-members = [".", "core", "agent"]
-# Commands from this directory cover all three, so `--features engine`,
-# `--bin c9watch-agent` and `--bins` work as before the split.
-default-members = [".", "core", "agent"]
+members = [".", "core"]
+default-members = [".", "core"]
 resolver = "2"
 
 [workspace.package]
@@ -20,7 +18,6 @@ version.workspace = true
 description = "Monitor and control Claude Code sessions, with Codex and Cursor Agent visibility"
 authors.workspace = true
 edition.workspace = true
-# Two binaries in engine builds: `cargo run` and `tauri dev` pick this one.
 default-run = "c9watch"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -55,13 +52,7 @@ gui = [
     "dep:tauri-nspanel",
 ]
 cli = ["c9watch-core/cli", "dep:clap", "dep:regex", "dep:tokio"]
-# Agent engine (C1a): `c9watch engine` and `api`, plus the `c9watch-agent`
-# binary (the `agent` package), unix only.
-engine = ["cli", "c9watch-core/engine", "dep:sha2"]
 gateway-assets = ["c9watch-core/gateway-assets"]
-# Test-only PTY input and screen files for tests/live/cc_sandbox.sh (C1a-32).
-# Never in release, default or CI builds.
-live-test = ["engine", "c9watch-core/live-test"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }

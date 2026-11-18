@@ -167,8 +167,6 @@ c9watch wait abc123 --until any-change -i 1
 
 Exit codes: `0` met, `2` no single live session matches, `3` stopped before `needs-input`, `124` timeout. `done` is met at once when the session is not Working. Details: [cli-events.md](cli-events.md).
 
-An engine build also has `wait --event turn_ended --agent <id|name> [--since <cursor>]` for an engine agent's next turn end. `--since` takes a cursor you hold, such as the `cursor` that `send` prints; see the note under `send` on why `send --wait` is the exact wait for an answer.
-
 ### `tasks` — Session Tasks/Todos
 
 Read tasks from `~/.claude/tasks/<session-id>/`.
@@ -199,45 +197,6 @@ Stops a detected Claude Code session by PID.
 ```bash
 c9watch stop <pid>
 ```
-
-### `spawn --mode free` — Start an Engine Agent
-
-**Engine builds only (`--features engine`, not released):** `--mode free` creates an engine agent:
-
-```bash
-c9watch spawn --mode free --cwd /path/to/project --name researcher
-```
-
-- It auto-starts the engine and calls `agent.create`. It takes only `--cwd` (default: the current directory) and `--name`; any other option fails with `bad_args`.
-- It prints `{"agent": <row>}` (c9p/1 `AgentRow`) once the agent is `ready`. This can take up to 30 s, plus a margin.
-- A caller with `C9_AGENT_ID` set (inside an engine agent) gets `not_allowed` (the engine's code for the same refusal) and never reaches the engine.
-- Errors exit `1` with `{"error":"<code>: <msg>; <hint>"}`. Retire the agent with `c9watch api agent.retire '{"id":"agt_..."}'`.
-
-### `send` — Mail an Engine Agent
-
-**Engine builds only (`--features engine`, not released).** Sends one message to an engine agent (an agent the engine runs in a PTY, such as one from `spawn --mode free`) through the engine's `msg.send`. The engine queues the message. When the agent is ready and its input box is empty, the engine pastes the message into the box and submits it, so the agent reads it as its next prompt.
-
-```bash
-c9watch send researcher "Summarize findings in notes.md"     # by name
-c9watch send agt_01J... --file instructions.md --kind request
-c9watch send researcher --stdin --idem ci-build-42 < brief.txt
-c9watch send researcher "Review PR 12" --wait --timeout 600
-```
-
-- `TO` is an agent id (`agt_...`), `<machine>/<id>`, or a name. A name that two live agents share fails with `unknown_address` and lists the `candidates`; an unknown name gets the `nearest` one.
-- Give the text exactly once: `MESSAGE`, `--message`, `--stdin` or `--file`. CRLF line ends become LF.
-- `--kind request|info` (default `info`), `--reply-to <msg id>` (the reply joins that message's thread), `--idem <key>`.
-- It prints `{"msg": {"msgId", "state", "to", "cursor", "replayed"}}`. `state` is `queued`.
-- An engine error prints `{"error": {"code", "msg", "hint", "data"}}` on stderr and exits `1`. `data` is there only for some codes, for example `nearest`, `candidates`, or the target's `state` for `not_controlled`. Mail goes only to an agent the engine controls (`control='pty'`) that has not ended.
-- `--idem` makes a resend safe: the same sender, key and request get the first message back with `replayed: true`; the same key with a different request is `duplicate`. The key is unique per sender principal. Every terminal script is the same principal, `local-unverified`, so give each script its own prefix (for example `ci-build-42`, not `42`).
-
-**Waiting for the answer.** `--wait` follows the message from its `cursor`. It waits until the message is `delivered`, then for the agent's next turn end: the turn that answered the message. It prints a second line, `{"msg": {..., "state": "delivered", "detail": ...}, "turnEnd": "<cursor>"}`, and exits `0`. It exits `1` when the message ends `failed` or `uncertain` (the engine is not sure the agent got it, and does not send it again), and `2` when `--timeout` (default 300 s) runs out. After an `engine restart` it reconnects and goes on.
-
-`cursor` can also go to `c9watch wait --event turn_ended --agent <id> --since <cursor>`. That wait is not exact: the cursor is where the message was queued, so if the agent was mid-turn then, the wait ends with that turn, which did not read the message. Use `send --wait` to wait for the answer. A cursor older than the 24 h event retention (an idem replay can return one) gets `cursor_expired`.
-
-A message sent while the engine drains (`engine restart`) is still taken and stays `queued`; the resumed agent gets it.
-
-**From inside an agent** (`C9_AGENT_ID` set), `send` connects only to `C9_ENGINE_SOCK` and never starts the engine. `--wait` is refused there: end the turn instead, and the answer arrives as a new message. Every agent's SessionStart context carries this rule.
 
 ### `hooks` — Report Permission Prompts
 
@@ -305,50 +264,9 @@ c9watch search "database migration" --project myapp
 - **All output is JSON** on stdout. Errors go to stderr as `{"error": "..."}` with exit code 1.
 - **No stderr noise** — debug warnings are suppressed in CLI mode.
 - **System XML tags** (e.g., `<local-command-caveat>`, `<system-reminder>`) are stripped from all text fields.
-- **Write path** — `spawn` starts new sessions; in an engine build, `send` mails engine agents. All other commands are read-only. Claude Code's stdin for sessions not managed by c9watch is owned by the terminal process that launched them.
+- **Write path** — `spawn` starts new sessions. All other commands are read-only. Claude Code's stdin for sessions not managed by c9watch is owned by the terminal process that launched them.
 
 ### Public preview data
 
-An engine-enabled build also provides `c9watch export <sessions|cost|history|events|annotations>`.
-It reads through c9p and starts core when needed. Use `--format csv`, `--since`,
-`--until`, and `--out` for reports. History and events omit conversation fields
-unless `--include-conversation` is set. Annotation export needs a core with L1.
-See [the export guide](api/extending.md) for exact row and time semantics.
-
 `c9watch api schema [--public]` prints the embedded c9p schema offline. This works
-in CLI-only builds too. Raw `api <method> '<json>'` calls still need the engine
-feature. See [the preview API guide](api/README.md).
-
-### Engine mail and mailbox controls
-
-In engine builds:
-
-```sh
-c9watch mail list [agent] --thread THREAD --before MSG_ID --limit 50 --pretty
-c9watch mail read MSG_ID --pretty
-c9watch mail cancel MSG_ID
-c9watch mail pause AGENT
-c9watch mail resume AGENT
-c9watch send AGENT --reply-to MSG_ID "reply"
-```
-
-Each filter is optional. List/read print JSON by default. `--pretty`
-groups messages by thread and shows peer/paste, state, reply links and
-history. Reading does not mark a message read by the model. Only a person
-may cancel queued mail or pause/resume incoming agent/system mail; human
-mail continues. Errors include `not_cancellable` (with current state) and
-`hop_limit` (with hop). `send --wait` exits 1 on rejected, expired or
-cancelled mail, and keeps waiting on a held detail.
-
-`C9_MAIL_SOCKET` defaults off. Set it to `on` for the experimental CC peer
-path; human mail always uses paste. Temporary socket failures never fall
-back to paste. A successful write is not delivery; `uncertain` mail is
-never resent automatically. Reply through the CLI, not SendMessage. Do
-not reply to system mail. See [mail semantics](engine-mail.md).
-
-Before it starts or resumes an agent, the engine reads `claude --version`.
-Its screen profile is recorded on Claude Code 2.1.312 up to (not including)
-2.2.0. Another version, or a version it cannot read, still starts: the
-engine uses the newest profile and writes a warning with the version and
-the supported range to its log and to the audit (method `cc.version`,
-decision `untested`). Only a missing `claude` fails the create or resume.
+in CLI-only builds too. See [the preview API guide](api/README.md).

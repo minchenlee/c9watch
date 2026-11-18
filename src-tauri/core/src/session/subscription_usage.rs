@@ -12,7 +12,6 @@ use tokio::{
 };
 
 #[derive(Clone, Debug, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UsageWindow {
     label: String,
@@ -22,7 +21,6 @@ pub struct UsageWindow {
     window_seconds: Option<i64>,
 }
 #[derive(Clone, Debug, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionUsage {
     provider: String,
