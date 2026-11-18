@@ -80,6 +80,8 @@
 
 	let viewMode = $state<'project' | 'all' | 'dense'>('project');
 	let isDense = $derived(viewMode === 'dense');
+	type MonitorSort = 'attention' | 'project' | 'last-active';
+	let sortMode = $state<MonitorSort>('attention');
 
 	let isCompact = $state(false);
 
@@ -117,6 +119,10 @@
 			const saved = localStorage.getItem('sessionViewMode');
 			if (saved === 'project' || saved === 'all' || saved === 'dense') {
 				viewMode = saved;
+			}
+			const savedSort = localStorage.getItem('monitorSort');
+			if (savedSort === 'project' || savedSort === 'last-active') {
+				sortMode = savedSort;
 			}
 			const savedCompact = localStorage.getItem('sessionViewCompact');
 			if (savedCompact === 'true') {
@@ -212,6 +218,12 @@
 	});
 
 	$effect(() => {
+		if (browser) {
+			localStorage.setItem('monitorSort', sortMode);
+		}
+	});
+
+	$effect(() => {
 		if (!browser) return;
 
 		const tabByKey: Record<string, typeof activeTab> = {
@@ -252,6 +264,19 @@
 		lastModified: number;
 	};
 
+	function projectName(path: string): string {
+		return path.split(/[/\\]/).filter(Boolean).pop() || path;
+	}
+
+	function byLastActive(a: Session, b: Session): number {
+		return (Date.parse(b.modified) || 0) - (Date.parse(a.modified) || 0);
+	}
+
+	function byProject(a: Session, b: Session): number {
+		return projectName(a.projectPath).localeCompare(projectName(b.projectPath)) ||
+			a.projectPath.localeCompare(b.projectPath);
+	}
+
 	// Helper function to group sessions by project path, then by status
 	function groupByProjectAndStatus(sessions: Session[]) {
 		const groups: ProjectGroup[] = [];
@@ -259,11 +284,9 @@
 		sessions.forEach(session => {
 			let group = groups.find(g => g.path === session.projectPath);
 			if (!group) {
-				const parts = session.projectPath.split(/[/\\]/);
-				const folderName = parts.filter(Boolean).pop() || session.projectPath;
 				group = {
 					path: session.projectPath,
-					displayName: folderName,
+					displayName: projectName(session.projectPath),
 					attention: [],
 					idle: [],
 					working: [],
@@ -274,6 +297,17 @@
 
 			addToGroup(group, session);
 		});
+
+		if (sortMode === 'last-active') {
+			for (const group of groups) {
+				for (const { id } of STATUS_BUCKETS) group[id].sort(byLastActive);
+			}
+			return groups.sort((a, b) => b.lastModified - a.lastModified);
+		}
+		if (sortMode === 'project') {
+			return groups.sort((a, b) => a.displayName.localeCompare(b.displayName) ||
+				a.path.localeCompare(b.path));
+		}
 
 		return sortGroups(groups);
 	}
@@ -286,7 +320,9 @@
 			if (bucket) groups[bucket].push(session);
 		});
 
-		const sortSessions = (a: Session, b: Session) => new Date(a.modified).getTime() - new Date(b.modified).getTime();
+		const oldestFirst = (a: Session, b: Session) => Date.parse(a.modified) - Date.parse(b.modified);
+		const sortSessions = sortMode === 'project' ? byProject :
+			sortMode === 'last-active' ? byLastActive : oldestFirst;
 
 		return STATUS_BUCKETS.map(({ id, label }) => ({
 			id,
@@ -653,6 +689,11 @@
 						</button>
 					{/if}
 					<div class="header-spacer"></div>
+					<select class="monitor-sort" aria-label="Sort sessions" bind:value={sortMode}>
+						<option value="attention">Attention first</option>
+						<option value="project">Project (A–Z)</option>
+						<option value="last-active">Last active</option>
+					</select>
 					<div class="view-toggle">
 						<button
 							class="toggle-btn"
@@ -771,6 +812,8 @@
 				{#if viewMode === 'dense'}
 					<DenseBoard
 						groups={projectGroups}
+						useGroupOrder={sortMode !== 'attention'}
+						compareSessions={sortMode === 'last-active' ? byLastActive : undefined}
 						compact={isCompact}
 						fontScale={denseFontScale}
 						onexpand={handleExpand}
@@ -1271,6 +1314,39 @@
 		flex: 1;
 	}
 
+	/* Same box as .view-toggle: square, 34px high, muted mono label. The
+	   native look is off, so the arrow is drawn here. */
+	.monitor-sort {
+		appearance: none;
+		-webkit-appearance: none;
+		height: 34px;
+		margin: 0;
+		padding: 0 26px 0 var(--space-sm);
+		border: 1px solid var(--border-default);
+		border-radius: 0;
+		background-color: rgba(255, 255, 255, 0.03);
+		background-image:
+			linear-gradient(45deg, transparent 50%, var(--text-muted) 50%),
+			linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
+		background-position: right 13px center, right 8px center;
+		background-size: 5px 5px;
+		background-repeat: no-repeat;
+		color: var(--text-muted);
+		font-family: var(--font-mono);
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		cursor: pointer;
+		transition: all 0.2s ease;
+	}
+
+	.monitor-sort:hover,
+	.monitor-sort:focus-visible {
+		color: var(--text-primary);
+		border-color: var(--text-muted);
+		outline: none;
+	}
+
 	.view-toggle {
 		display: flex;
 		gap: var(--space-xs);
@@ -1496,6 +1572,25 @@
 		.view-toggle {
 			padding: 1px;
 		}
+
+		/* Narrow: the arrow only, so the header stays on one line. The
+		   label is still the accessible name and the menu still has text. */
+		.monitor-sort {
+			width: 28px;
+			height: 36px;
+			padding: 0;
+			color: transparent;
+			background-position: calc(50% - 2.5px) center, calc(50% + 2.5px) center;
+		}
+
+		.monitor-sort:hover,
+		.monitor-sort:focus-visible {
+			color: transparent;
+		}
+
+		/* The short attention label makes room for the sort control. */
+		.system-section .attention-label { display: none; }
+		.system-section .attention-label-short { display: inline; }
 
 		.toggle-btn {
 			width: 32px;
