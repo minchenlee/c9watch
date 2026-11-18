@@ -1,5 +1,5 @@
 /** M-b public-key challenge-response adapter (D15). All wire byte strings
- * use lowercase hex; see docs/api/gateway.md before integrating another codec.
+ * use lowercase hex; see src-tauri/core/src/gateway/pubkey.rs before integrating another codec.
  * The client proves its own Ed25519 key; no shared secret crosses the
  * WebSocket or is stored by core. */
 export interface GatewayPairing { clientId: string; privateKey: CryptoKey; serverKey: string; machineId: string }

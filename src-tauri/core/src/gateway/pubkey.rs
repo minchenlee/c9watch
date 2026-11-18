@@ -265,9 +265,8 @@ mod tests {
         to_hex(&k.sign(m).to_bytes())
     }
 
-    /// The same bytes are asserted by the SDK and GUI tests
-    /// (`packages/c9p-client/test/transports.test.mjs`,
-    /// `scripts/test-data-client.mjs`), so the encodings cannot drift.
+    /// The same bytes are asserted by the GUI test
+    /// (`scripts/test-data-client.mjs`), so the encodings cannot drift.
     #[test]
     fn cross_language_vectors() {
         let (machine, client) = keys();

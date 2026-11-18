@@ -1,20 +1,15 @@
 <script lang="ts">
     // 設定 (build plan G10a): Shell (classic / glass), Glass Off / Subtle /
-    // Full, the monthly fee for 用量, 重新排列房間 (D7, not built yet), the
-    // extension list (read-only, G6 registry) and 規則與授權 (D5, D9 = C:
+    // Full, the monthly fee for 用量, 重新排列房間 (D7, not built yet) and
+    // 規則與授權 (D5, D9 = C:
     // only 允許 rules; core keeps no rules yet, Gap R).
     // Native vibrancy is G10b: this page only stores `ui.glass` and the
     // shell sets `data-glass` on `.glass-root`.
-    import { onMount } from 'svelte';
     import { shell } from '$lib/data/stores/settings';
     import { fixtureOn } from '../data';
     import { DEMO_RULES } from '../model/gaps-demo';
     import { glassMode, monthlyFee, parseFee, type GlassMode } from '../prefs';
-    import { extensions, extensionsLoaded, loadExtensions } from '../ext/registry';
-    import { describeEntry, type ExtEntry } from '../ext/manifest';
     import { codeParts } from './workspace-extras';
-
-    onMount(() => { void loadExtensions(); });
 
     const MODES: { id: GlassMode; label: string; note: string }[] = [
         { id: 'off', label: 'Off', note: '不透明，最好讀' },
@@ -42,11 +37,6 @@
         if (e.isComposing || e.keyCode === 229) return;
         if (e.key === 'Enter') { e.preventDefault(); saveFee(); }
     }
-
-    const STATUS: Record<ExtEntry['status'], string> = {
-        ok: '啟用', manifest_error: '設定檔有錯', version_mismatch: '版本不合', shadowed: '被蓋過', dev_only: '只在開發版'
-    };
-    const where = (e: ExtEntry) => (e.source === 'first' ? `app 內建 › extensions/${e.dir}/` : `engine home › extensions/${e.dir}/`);
 
     // D9 = C: the list shows 允許 rules only. Demo rules, fixture only.
     $: rules = $fixtureOn ? DEMO_RULES.filter(r => r.kind === '授權') : [];
@@ -112,31 +102,6 @@
         </div>
     </section>
 
-    <section aria-labelledby="s-ext">
-        <h2 class="psec" id="s-ext">Extensions <span>{$extensions.length}</span></h2>
-        {#if !$extensionsLoaded}
-            <p class="state-msg">讀取中</p>
-        {:else if !$extensions.length}
-            <p class="state-msg">沒有安裝 extension</p>
-        {:else}
-            <table class="tbl" data-table="extensions">
-                <thead><tr><th>名稱</th><th>版本</th><th>來源</th><th>狀態</th><th>目錄</th></tr></thead>
-                <tbody>
-                    {#each $extensions as e (e.source + '/' + e.dir)}
-                        <tr data-ext-row={e.dir} data-source={e.source} data-status={e.status}>
-                            <td class="t">{e.manifest?.name ?? e.dir}</td>
-                            <td class="mono">{e.manifest?.version ?? '—'}</td>
-                            <td>{e.source === 'first' ? '第一方' : '第三方'}</td>
-                            <td><span class="st" class:bad={e.status !== 'ok'}>{STATUS[e.status]}</span><span class="why">{describeEntry(e)}</span></td>
-                            <td class="mono dir">{where(e)}</td>
-                        </tr>
-                    {/each}
-                </tbody>
-            </table>
-        {/if}
-        <p class="note">唯讀。新增或移除 extension：放進或拿出目錄，再重新開 c9watch。第三方的目錄在 engine home（macOS 預設 <code>~/Library/Application Support/c9watch/engine</code>）。</p>
-    </section>
-
     <section aria-labelledby="s-rules" data-section="rules">
         <h2 class="psec" id="s-rules">規則與授權</h2>
         {#if rules.length}
@@ -172,13 +137,12 @@
         color: var(--text-1);
     }
     .psec::before { content: ''; width: 8px; height: 8px; background: var(--status-idle); }
-    .psec span { color: var(--text-3); }
     .box { display: grid; background: var(--surface-1); }
     .field { display: grid; gap: var(--space-2); padding: 14px var(--space-4); border-bottom: 1px solid var(--divider); }
     .field:last-child { border-bottom: 0; }
     .lbl { font: var(--type-label); color: var(--text-2); }
     .note { margin: 0; font: var(--type-label); color: var(--text-3); }
-    .note code, .rule code { font: var(--type-meta); color: var(--text-1); overflow-wrap: anywhere; }
+    .rule code { font: var(--type-meta); color: var(--text-1); overflow-wrap: anywhere; }
     .mono { font: var(--type-meta); }
     .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
     .seg { display: flex; flex-wrap: wrap; gap: var(--space-1); }
@@ -210,22 +174,11 @@
     .ok { font: var(--type-label); color: var(--text-3); }
     .confirm { display: grid; gap: var(--space-2); padding: var(--space-3); border: 1px solid var(--glass-stroke); border-radius: var(--radius-md); }
     .confirm p { margin: 0; font: var(--type-body); color: var(--text-2); }
-    .tbl { width: 100%; border-collapse: collapse; background: var(--surface-1); font: var(--type-body); }
-    .tbl th { text-align: left; font: var(--type-label); color: var(--text-3); padding: 10px var(--space-4); border-bottom: 1px solid var(--divider); }
-    .tbl td { padding: 10px var(--space-4); border-bottom: 1px solid var(--divider); color: var(--text-2); vertical-align: top; }
-    .tbl tr:last-child td { border-bottom: 0; }
     .t { color: var(--text-1); }
-    .st { display: block; color: var(--text-1); }
-    .st.bad { color: var(--status-error-text); }
-    .why { display: block; font: var(--type-label); color: var(--text-3); }
-    .dir { overflow-wrap: anywhere; font-size: 12px; color: var(--text-3); }
     .preview { margin: 0; font: var(--type-label); color: var(--status-input-text); }
     .list { margin: 0; padding: 0; list-style: none; background: var(--surface-1); }
     .rule { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-1) var(--space-3); padding: 10px var(--space-4); border-bottom: 1px solid var(--divider); }
     .rule .meta { grid-column: 1; font-size: 12px; color: var(--text-3); }
     .rule button { grid-row: 1 / span 2; grid-column: 2; align-self: center; }
     .rule:last-child { border-bottom: 0; }
-    @media (max-width: 700px) {
-        .tbl th, .tbl td { padding: 8px var(--space-2); }
-    }
 </style>

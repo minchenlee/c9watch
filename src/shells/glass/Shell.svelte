@@ -17,7 +17,6 @@
     import Usage from './pages/Usage.svelte';
     import Settings from './pages/Settings.svelte';
     import { handled, pruneHandled } from './handling/handled';
-    import ExtPages from './ext/ExtPages.svelte';
 
     // startGlassData returns its stop function, which Svelte runs on unmount.
     onMount(startGlassData);
@@ -50,7 +49,6 @@
             case 'needs': return { title: '需要你', empty: '需要你處理的事會出現在這裡' };
             case 'today': return { title: '今天', empty: '你離開之後發生的事會出現在這裡' };
             case 'ws': return { title: wsTitle(r.id, fixture, live), empty: '這個 workspace 的 agent 會出現在這裡' };
-            case 'ext': return { title: r.extId, empty: '沒有這個 extension 頁面' };
             case 'usage': return { title: '用量', empty: '花費和 token 用量會出現在這裡' };
             case 'settings': return { title: '設定', empty: '設定會出現在這裡' };
         }
@@ -77,7 +75,7 @@
     {/if}
     {#if $route.page === 'needs'}
         <div class="glass-page full"><Needs /></div>
-    {:else if $route.page !== 'ext'}
+    {:else}
         <main class="glass-page" aria-label={info.title}>
             {#if $route.page === 'ws'}
                 <Workspace id={$route.id} title={info.title} />
@@ -93,8 +91,6 @@
             {/if}
         </main>
     {/if}
-    <!-- Extension pages (G6). Always mounted: it keeps the last one alive. -->
-    <ExtPages route={$route} />
     {#if hint}
         <div class="hint glass-float" role="status">
             {#if hint === 'delegate'}
