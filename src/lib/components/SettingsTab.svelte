@@ -4,6 +4,7 @@
 	import NotificationSettings from './NotificationSettings.svelte';
 	import RemoteAccessSettings from './RemoteAccessSettings.svelte';
 	import UsageSettings from './UsageSettings.svelte';
+	import MonitorCardSettings from './MonitorCardSettings.svelte';
 	import { renderPlainMarkdown } from '$lib/markdown';
 	import { openUrl } from '$lib/data/platform';
 	import { isTauri } from '$lib/ws';
@@ -22,7 +23,7 @@
 	} from '$lib/stores/updater';
 
 	let checking = $state(false);
-	let activeSection = $state<'notifications' | 'usage' | 'integration' | 'remote' | 'about'>('notifications');
+	let activeSection = $state<'notifications' | 'usage' | 'monitor' | 'integration' | 'remote' | 'about'>('notifications');
 	let nativeNotifications = $state(false);
 	let justChecked = $state(false);
 
@@ -105,6 +106,7 @@
         <nav class="settings-nav" aria-label="Settings sections">
             {#if nativeNotifications}<button class:active={activeSection === 'notifications'} aria-current={activeSection === 'notifications' ? 'page' : undefined} onclick={() => activeSection = 'notifications'}>Notifications</button>{/if}
             <button class:active={activeSection === 'usage'} aria-current={activeSection === 'usage' ? 'page' : undefined} onclick={() => activeSection = 'usage'}>Usage</button>
+            <button class:active={activeSection === 'monitor'} aria-current={activeSection === 'monitor' ? 'page' : undefined} onclick={() => activeSection = 'monitor'}>Monitor</button>
             {#if isTauri()}<button class:active={activeSection === 'integration'} aria-current={activeSection === 'integration' ? 'page' : undefined} onclick={() => activeSection = 'integration'}>Integration</button>{/if}
             {#if isTauri()}<button class:active={activeSection === 'remote'} aria-current={activeSection === 'remote' ? 'page' : undefined} onclick={() => activeSection = 'remote'}>Remote access</button>{/if}
             <button class:active={activeSection === 'about'} aria-current={activeSection === 'about' ? 'page' : undefined} onclick={() => activeSection = 'about'}>About &amp; updates</button>
@@ -112,6 +114,7 @@
         <div class="content"><div class="settings-body">
         {#if nativeNotifications}<div hidden={activeSection !== 'notifications'}><NotificationSettings /></div>{/if}
         <div hidden={activeSection !== 'usage'}><UsageSettings /></div>
+        <div hidden={activeSection !== 'monitor'}><MonitorCardSettings /></div>
         {#if isTauri()}<div hidden={activeSection !== 'integration'}><IntegrationSettings /></div>{/if}
         {#if isTauri()}<div hidden={activeSection !== 'remote'}><RemoteAccessSettings /></div>{/if}
         <div class="about-panel" hidden={activeSection !== 'about'}>

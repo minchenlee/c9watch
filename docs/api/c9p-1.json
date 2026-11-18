@@ -4209,6 +4209,14 @@
           "type": "integer",
           "x-sensitivity": "public"
         },
+        "model": {
+          "description": "Last reported model for this session.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
         "modified": {
           "type": "string",
           "x-sensitivity": "public"
@@ -4264,6 +4272,14 @@
         "provider": {
           "$ref": "#/$defs/SessionProvider",
           "x-sensitivity": "public"
+        },
+        "reasoningEffort": {
+          "description": "Reasoning effort recorded for the current or most recent turn.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
         },
         "rootSessionId": {
           "type": [
@@ -4328,6 +4344,15 @@
           ],
           "description": "For an agent-team teammate: its name, team, lead session and agent\ntype. The lead's own view has none; its teammates name it.",
           "x-sensitivity": "metadata"
+        },
+        "turnStartedAtMs": {
+          "description": "Start of the current turn in milliseconds since the Unix epoch, when reported.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
         },
         "waitingFor": {
           "anyOf": [

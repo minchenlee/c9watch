@@ -4,6 +4,9 @@
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
 	import { formatCostOrTokens } from '$lib/cost-utils';
 	import { isCostAvailable } from '$lib/cost-semantics';
+	import SessionModelLabel from './SessionModelLabel.svelte';
+	import WorkingDuration from './WorkingDuration.svelte';
+	import { monitorCardPreferences } from '$lib/stores/monitor-card-preferences';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { canSessionAction, sessionReturnKind, sessionKeyOf } from '$lib/provider';
 	import { awayActivity } from '$lib/stores/away';
@@ -215,6 +218,13 @@
 					{#if sourceHealthMeta}
 						<span class="source-health-badge {sourceHealthMeta.modifier}" title={sourceHealthMeta.title}>{sourceHealthMeta.label}</span>
 					{/if}
+					<SessionModelLabel
+						model={$monitorCardPreferences.model ? session.model : null}
+						reasoningEffort={$monitorCardPreferences.reasoningEffort ? session.reasoningEffort : null}
+					/>
+					{#if $monitorCardPreferences.workingDuration && session.status === SessionStatus.Working}
+						<WorkingDuration sessionKey={sessionKeyOf(session)} turnStartedAt={session.turnStartedAtMs} {compact} />
+					{/if}
 					<span class="session-name-badge">{session.sessionName}</span>
 				{#if isBackground}
 					<span class="kind-badge" aria-label="Background-pinned session" title="Background-pinned session">BG</span>
@@ -229,23 +239,27 @@
 
 			{#if !compact}
 				<div class="stats-group">
-					<span class="message-count">
-						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-							<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-						</svg>
-						{session.messageCount}
-					</span>
-					{#if costLabel}
+					{#if $monitorCardPreferences.messageCount}
+						<span class="message-count">
+							<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+								<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+							</svg>
+							{session.messageCount}
+						</span>
+					{/if}
+					{#if $monitorCardPreferences.cost && costLabel}
 						<span class="cost-pill" title={$costMode === 'usd' ? 'Session cost' : 'Session tokens'}>
 							{costLabel}
 						</span>
 					{/if}
-					<span class="time-badge">{formatTimeSince(startedAtIso)}</span>
+					{#if $monitorCardPreferences.sessionAge}
+						<span class="time-badge">{formatTimeSince(startedAtIso)}</span>
+					{/if}
 				</div>
 			{/if}
 			
 			{#if compact}
-				{#if costLabel}
+				{#if $monitorCardPreferences.cost && costLabel}
 					<span class="cost-pill compact-pill" title={$costMode === 'usd' ? 'Session cost' : 'Session tokens'}>{costLabel}</span>
 				{/if}
 				<div class="status-label" style="color: {statusColor}">
@@ -256,7 +270,7 @@
 
 		{#if !compact}
 			<!-- Git Branch -->
-			{#if session.gitBranch}
+			{#if $monitorCardPreferences.gitBranch && session.gitBranch}
 				<div class="git-branch">
 					<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 						<line x1="6" y1="3" x2="6" y2="15" />

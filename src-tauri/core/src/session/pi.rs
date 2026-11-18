@@ -72,6 +72,7 @@ pub struct PiTranscriptSummary {
     pub empty: bool,
     pub pending_tool_name: Option<String>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
@@ -443,6 +444,17 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                     }
                 }
             }
+            Some("model_change") => {
+                if let Some(model) = value.get("modelId").and_then(|model| model.as_str()) {
+                    summary.model = Some(model.to_owned());
+                }
+            }
+            Some("thinking_level_change") => {
+                summary.reasoning_effort = value
+                    .get("thinkingLevel")
+                    .and_then(|level| level.as_str())
+                    .map(str::to_owned);
+            }
             Some("message") => {
                 let Some(message) = value.get("message") else {
                     continue;
@@ -492,11 +504,8 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                         if let Some(t) = ts.clone() {
                             summary.last_timestamp = t;
                         }
-                        if summary.model.is_none() {
-                            summary.model = message
-                                .get("model")
-                                .and_then(|m| m.as_str())
-                                .map(str::to_string);
+                        if let Some(model) = message.get("model").and_then(|model| model.as_str()) {
+                            summary.model = Some(model.to_owned());
                         }
                         apply_pi_usage(&mut summary, message);
                         let blocks = message
@@ -1771,6 +1780,24 @@ mod tests {
         assert_eq!(summary.model.as_deref(), Some("anthropic/claude-opus-4-6"));
         // toolCall was answered by a toolResult → no pending tool.
         assert_eq!(summary.pending_tool_name, None);
+    }
+
+    #[test]
+    fn summary_tracks_pi_model_and_thinking_changes() {
+        let dir = TempDir::new().unwrap();
+        let path = write_transcript(
+            &dir,
+            "2026-08-16T07-07-48-328Z_abc123.jsonl",
+            &[
+                r#"{"type":"session","cwd":"/tmp/demo","timestamp":"2026-08-16T07:07:48Z"}"#,
+                r#"{"type":"message","message":{"role":"assistant","model":"original","content":[]}}"#,
+                r#"{"type":"model_change","modelId":"switched"}"#,
+                r#"{"type":"thinking_level_change","thinkingLevel":"high"}"#,
+            ],
+        );
+        let summary = summarize_pi_transcript(&path).unwrap();
+        assert_eq!(summary.model.as_deref(), Some("switched"));
+        assert_eq!(summary.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

@@ -34,6 +34,7 @@
 	import { refreshSessionHistory } from '$lib/stores/history';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
 	import SettingsTab from '$lib/components/SettingsTab.svelte';
+	import { observedWorkingSince } from '$lib/stores/monitor-clock';
 	import MailTab from '$lib/components/MailTab.svelte';
 	import { mailAvailable, mailFocus } from '$lib/stores/mail';
 	import SubscriptionUsage from '$lib/components/SubscriptionUsage.svelte';
@@ -45,6 +46,9 @@
 	import ProviderFilter from '$lib/components/ProviderFilter.svelte';
 	import { providerFilter } from '$lib/stores/provider-filter';
 	import { matchesProvider, providerFilterLabel, providerSessionKey, providerOf, sessionKeyOf } from '$lib/provider';
+
+	// Keep observing when the Monitor tab or duration fields are hidden.
+	onMount(() => observedWorkingSince.subscribe(() => {}));
 
 	let demoActive = $derived($isDemoMode);
 	let showQRModal = $state(false);
