@@ -359,7 +359,9 @@
 		background: var(--bg-card);
 		border: 1px solid var(--border-default);
 		cursor: pointer;
-		transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+		/* Hover only. `transition: all` also animates layout when preview text
+		   changes on each refresh, and WebKit retains those transitions. */
+		transition: border-color 0.2s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 		text-align: left;
 		width: 100%;
 		height: 235px;
@@ -697,7 +699,7 @@
 		font-weight: 600;
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
-		transition: all 0.2s ease;
+		transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
 		cursor: pointer;
 	}
 

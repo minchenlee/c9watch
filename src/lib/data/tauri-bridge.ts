@@ -4,6 +4,15 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { Transport, StreamFrame, RequestOptions } from './transport';
+
+/** Tauri keeps every `transformCallback` until an explicit unregister. A
+ * `Channel` unregisters itself only when it receives an `end` frame, which a
+ * finished or rejected command never sends. */
+function releaseIpcCallback(id: number): void {
+    const unregister = (globalThis as { window?: { __TAURI_INTERNALS__?: { unregisterCallback?: (id: number) => void } } })
+        .window?.__TAURI_INTERNALS__?.unregisterCallback;
+    if (typeof unregister === 'function') unregister(id);
+}
 import type { C9pProgressFrame } from '../c9p-1';
 import type { C9pMethod, C9pMethods } from '../c9p-1';
 import { C9pError } from './transport';
@@ -43,25 +52,40 @@ async function fallback(method: C9pMethod, p: any, options?: RequestOptions): Pr
 export const tauriTransport: Transport = {
     async request<M extends C9pMethod>(method: M, params: C9pMethods[M]['params'], options?: RequestOptions) {
         // Only a conversation read sends progress frames on this channel.
+        // The channel's callback is not tied to the command result: Tauri drops
+        // it only after an `end` frame, which a normal or failed request never
+        // sends. Release it once the command has settled.
         const progress = new Channel<C9pProgressFrame>();
         if (options?.onProgress) progress.onmessage = options.onProgress;
-        try { return await invoke<C9pMethods[M]['result']>('c9p_request', { method, params, progress }); }
-        catch (error: any) {
+        try {
+            return await invoke<C9pMethods[M]['result']>('c9p_request', { method, params, progress });
+        } catch (error: any) {
             if (error?.code === 'core_unavailable') return fallback(method, params, options);
             if (error && typeof error.code === 'string') {
                 throw Object.assign(new C9pError(error.code, error.msg ?? 'Core request failed', error.retryable), error);
             }
             throw error;
+        } finally {
+            releaseIpcCallback(progress.id);
         }
     },
     async subscribe(params, onFrame) {
         let closed = false;
         const channel = new Channel<StreamFrame>();
+        const release = () => {
+            if (closed) return;
+            closed = true;
+            releaseIpcCallback(channel.id);
+        };
         channel.onmessage = frame => { if (!closed) onFrame(frame); };
         let sub: string;
         try { sub = await invoke<string>('c9p_subscribe', { params, channel }); }
-        catch (error) { closed = true; throw error; }
-        return () => { if (!closed) { closed = true; void invoke('c9p_unsubscribe', { sub }).catch(() => {}); } };
+        catch (error) { release(); throw error; }
+        return () => {
+            if (closed) return;
+            release();
+            void invoke('c9p_unsubscribe', { sub }).catch(() => {});
+        };
     }
 };
 
