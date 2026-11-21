@@ -9,7 +9,8 @@ const wsUrl = 'data:text/javascript;base64,' + Buffer.from(wsCode).toString('bas
 const code = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 }
 }).outputText.replace("'./ws'", JSON.stringify(wsUrl)).replaceAll("'svelte/transition'", JSON.stringify(import.meta.resolve('svelte/transition')))
-  .replaceAll("'svelte/easing'", JSON.stringify(import.meta.resolve('svelte/easing')));
+  .replaceAll("'svelte/easing'", JSON.stringify(import.meta.resolve('svelte/easing')))
+  .replaceAll("'svelte/animate'", JSON.stringify(import.meta.resolve('svelte/animate')));
 const transitions = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'));
 
 test('hidden intros and outros bypass delayed keyframes, including explicit delays', () => {
