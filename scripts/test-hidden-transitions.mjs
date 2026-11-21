@@ -56,3 +56,18 @@ test('conversation bubbles do not add a second opacity animation outside the saf
   const bubble = readFileSync(new URL('../src/lib/components/MessageBubble.svelte', import.meta.url), 'utf8');
   assert.doesNotMatch(bubble, /animation\s*:\s*fade-in/);
 });
+
+test('a list reorder is instant in the desktop webview and animated in a browser', () => {
+  const node = { ownerDocument: { visibilityState: 'visible' }, clientWidth: 100, clientHeight: 40, parentElement: null };
+  const fromTo = { from: { left: 0, top: 0, width: 100, height: 40 }, to: { left: 0, top: 80, width: 100, height: 40 } };
+  globalThis.getComputedStyle = () => ({ transform: 'none', transformOrigin: '50px 20px', zoom: '1' });
+  try {
+    globalThis.window = { matchMedia: () => ({ matches: false }) };
+    const browser = transitions.listFlip(node, fromTo, { duration: 400 });
+    assert.equal(browser.duration, 400);
+    assert.equal(typeof browser.css, 'function');
+    globalThis.window.__TAURI_INTERNALS__ = { invoke() {} };
+    // Svelte starts no Web Animation when duration and delay are both 0.
+    assert.deepEqual(transitions.listFlip(node, fromTo, { duration: 400 }), { duration: 0, delay: 0 });
+  } finally { delete globalThis.window; delete globalThis.getComputedStyle; }
+});
