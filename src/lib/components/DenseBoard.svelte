@@ -1,6 +1,5 @@
 <script lang="ts">
-	import { flip } from 'svelte/animate';
-	import { flyIn } from '$lib/transitions';
+	import { flyIn, listFlip } from '$lib/transitions';
 	import type { Session } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
 	import { sessionKeyOf } from '$lib/provider';
@@ -78,7 +77,7 @@
 					</header>
 					<div class="rows">
 						{#each tile.sessions as session (sessionKeyOf(session))}
-							<div class="row-slot" animate:flip={{ duration: 250 }}>
+							<div class="row-slot" animate:listFlip={{ duration: 250 }}>
 								<DenseSessionRow
 									{session}
 									{compact}

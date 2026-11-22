@@ -1,3 +1,5 @@
+import { flip } from 'svelte/animate';
+import type { FlipParams } from 'svelte/animate';
 import { fly, fade as svelteFade, scale as svelteScale, slide as svelteSlide, type FlyParams, type FadeParams, type ScaleParams, type SlideParams } from 'svelte/transition';
 import { cubicOut } from 'svelte/easing';
 import { isTauri } from './ws';
@@ -52,6 +54,19 @@ export function flyIn(
 		easing: EXPO_OUT,
 		opacity: 0,
 	} satisfies FlyParams);
+}
+
+// Reorder animation for `{#each}` blocks. Svelte's `animate` always creates a
+// zero-delay Web Animations dummy whose cancelled `onfinish` WKWebView keeps
+// alive, so every reorder retains another animation. The native webview
+// already skips intro motion; a reorder there jumps to the same place.
+export function listFlip(
+	node: Element,
+	fromTo: { from: DOMRect; to: DOMRect },
+	params: FlipParams = {}
+) {
+	if (skipMotion(node)) return { duration: 0, delay: 0 };
+	return flip(node, fromTo, params);
 }
 
 // Plain fade that respects reduced motion.

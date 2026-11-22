@@ -9,7 +9,8 @@ const wsUrl = 'data:text/javascript;base64,' + Buffer.from(wsCode).toString('bas
 const code = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 }
 }).outputText.replace("'./ws'", JSON.stringify(wsUrl)).replaceAll("'svelte/transition'", JSON.stringify(import.meta.resolve('svelte/transition')))
-  .replaceAll("'svelte/easing'", JSON.stringify(import.meta.resolve('svelte/easing')));
+  .replaceAll("'svelte/easing'", JSON.stringify(import.meta.resolve('svelte/easing')))
+  .replaceAll("'svelte/animate'", JSON.stringify(import.meta.resolve('svelte/animate')));
 const transitions = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'));
 
 test('hidden intros and outros bypass delayed keyframes, including explicit delays', () => {
@@ -54,4 +55,19 @@ test('native transitions never install a first frame that can freeze when hidden
 test('conversation bubbles do not add a second opacity animation outside the safe transition', () => {
   const bubble = readFileSync(new URL('../src/lib/components/MessageBubble.svelte', import.meta.url), 'utf8');
   assert.doesNotMatch(bubble, /animation\s*:\s*fade-in/);
+});
+
+test('a list reorder is instant in the desktop webview and animated in a browser', () => {
+  const node = { ownerDocument: { visibilityState: 'visible' }, clientWidth: 100, clientHeight: 40, parentElement: null };
+  const fromTo = { from: { left: 0, top: 0, width: 100, height: 40 }, to: { left: 0, top: 80, width: 100, height: 40 } };
+  globalThis.getComputedStyle = () => ({ transform: 'none', transformOrigin: '50px 20px', zoom: '1' });
+  try {
+    globalThis.window = { matchMedia: () => ({ matches: false }) };
+    const browser = transitions.listFlip(node, fromTo, { duration: 400 });
+    assert.equal(browser.duration, 400);
+    assert.equal(typeof browser.css, 'function');
+    globalThis.window.__TAURI_INTERNALS__ = { invoke() {} };
+    // Svelte starts no Web Animation when duration and delay are both 0.
+    assert.deepEqual(transitions.listFlip(node, fromTo, { duration: 400 }), { duration: 0, delay: 0 });
+  } finally { delete globalThis.window; delete globalThis.getComputedStyle; }
 });

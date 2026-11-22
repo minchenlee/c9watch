@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { fade } from '$lib/transitions';
-	import { flip } from 'svelte/animate';
-	import { fadeIn, flyIn } from '$lib/transitions';
+	import { fadeIn, flyIn, listFlip } from '$lib/transitions';
 	import { onMount, untrack } from 'svelte';
 	import { browser } from '$app/environment';
 	import {
@@ -798,7 +797,7 @@
 				{:else if viewMode === 'project'}
 					{#each projectGroups as group, gi (group.path)}
 						{@const baseIdx = projectOffsets[gi] ?? 0}
-						<section class="project-section" in:flyIn|global={{ index: baseIdx }} animate:flip={{ duration: 400 }}>
+						<section class="project-section" in:flyIn|global={{ index: baseIdx }} animate:listFlip={{ duration: 400 }}>
 							<div class="project-header">
 								<span class="project-name">{group.displayName}</span>
 								<span class="project-count">
@@ -821,7 +820,7 @@
 											<div
 												class="card-wrapper"
 												in:flyIn|global={{ index: bucketIdx + i }}
-												animate:flip={{ duration: 400 }}
+												animate:listFlip={{ duration: 400 }}
 											>
 												<SessionCard
 													{session}
@@ -842,7 +841,7 @@
 				{:else}
 					{#each allStatusGroups as group, gi (group.id)}
 						{@const baseIdx = allGroupOffsets[gi] ?? 0}
-						<section class="project-section" in:flyIn|global={{ index: baseIdx }} animate:flip={{ duration: 400 }}>
+						<section class="project-section" in:flyIn|global={{ index: baseIdx }} animate:listFlip={{ duration: 400 }}>
 							<div class="status-header all-view {group.type}">
 								<span class="status-indicator {group.type}" style="width: 8px; height: 8px;"></span>
 								<span class="project-name" style="font-size: 16px;">{group.label}</span>
@@ -854,7 +853,7 @@
 									<div
 										class="card-wrapper"
 										in:flyIn|global={{ index: baseIdx + 1 + i }}
-										animate:flip={{ duration: 400 }}
+										animate:listFlip={{ duration: 400 }}
 									>
 										<SessionCard
 											{session}
