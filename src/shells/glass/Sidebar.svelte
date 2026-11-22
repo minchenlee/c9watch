@@ -1,15 +1,11 @@
 <script lang="ts">
     // The glass side bar (redesign §8.7–8.10, R7-SPEC §C.1, owner D40):
     // brand + collapse, ⌘N / ⌘K, 需要你 → 今天 → workspaces with lead and
-    // talk rows → extension pages → 用量 / 設定. v1 has no goal rows and no
-    // office entry. Extension pages (G6): first-party first (the office's
-    // place), then third-party, all before 用量.
+    // talk rows → 用量 / 設定. v1 has no goal rows and no office entry.
     import { route, routeHash, type GlassRoute } from './nav';
     import { agents, fixtureOn } from './data';
     import { DEMO_WORKSPACES } from './model/gaps-demo';
     import type { C9pAgentRow } from '$lib/c9p-1';
-    import { extensions } from './ext/registry';
-    import { sidebarPages } from './ext/manifest';
 
     export let needs: number;
     export let onCollapse: () => void;
@@ -34,8 +30,6 @@
     $: workspaces = $fixtureOn
         ? DEMO_WORKSPACES.map((w): Workspace => ({ id: w.id, name: w.name, rows: rowsFor($agents, w.root) }))
         : [];
-
-    $: extPages = sidebarPages($extensions);
 
     const key = (r: GlassRoute) => routeHash(r).slice(2);
     $: current = key($route);
@@ -72,7 +66,6 @@
         {/each}
     </div>
     <div class="foot">
-        <div class="ext-slot" data-slot="extensions">{#each extPages as x (`${x.extId}/${x.page.id}`)}{@const r = { page: 'ext', extId: x.extId, pageId: x.page.id } as const}<a class="ni" href={routeHash(r)} aria-current={here(r, current)} data-ext={x.extId} data-source={x.source}><span class="name">{x.page.title}</span></a>{/each}</div>
         <a class="ni" href={routeHash({ page: 'usage' })} aria-current={here({ page: 'usage' }, current)}>用量</a>
         <a class="ni" href={routeHash({ page: 'settings' })} aria-current={here({ page: 'settings' }, current)}>設定</a>
     </div>
@@ -126,7 +119,7 @@
         background: var(--surface-1);
         font-size: 13px;
     }
-    .grp, .workspaces, .foot, .ext-slot { display: flex; flex-direction: column; gap: 1px; }
+    .grp, .workspaces, .foot { display: flex; flex-direction: column; gap: 1px; }
     .workspaces { gap: var(--space-3); }
     .foot { margin-top: auto; }
     .ni, .cap {
