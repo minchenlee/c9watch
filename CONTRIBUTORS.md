@@ -37,6 +37,7 @@ We appreciate all contributions, big and small. Thank you to the following peopl
 - **Grimmer Kang** ([@grimmerk](https://github.com/grimmerk)) - Sliding window rendering for large conversations ([#53](https://github.com/minchenlee/c9watch/pull/53))
 - **Jamie Goodfellow** ([@boogle42](https://github.com/boogle42)) - Cache subagent detection and message counts so old sessions are not re-parsed every poll ([#133](https://github.com/minchenlee/c9watch/pull/133))
 - **Jamie Goodfellow** ([@boogle42](https://github.com/boogle42)) - Cut dashboard and idle energy use: fewer CLI spawns, no updates for hidden windows, lighter status-bar animation ([#138](https://github.com/minchenlee/c9watch/pull/138))
+- **Benjamin Dupin** ([@bnjdpn](https://github.com/bnjdpn)) - Stop the desktop webview from retaining an animation on every refresh ([#251](https://github.com/minchenlee/c9watch/pull/251))
 
 ### UI/UX
 
