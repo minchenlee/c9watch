@@ -121,6 +121,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "bnjdpn",
+      "name": "Benjamin Dupin",
+      "avatar_url": "https://github.com/bnjdpn.png",
+      "profile": "https://github.com/bnjdpn",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "contributorsPerLine": 7,
