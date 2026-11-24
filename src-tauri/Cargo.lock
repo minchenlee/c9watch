@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "c9watch"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "c9watch-core"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

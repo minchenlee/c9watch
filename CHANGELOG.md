@@ -7,19 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Removed
-- Removed the unshipped pm-orchestration CLI feature and its hidden UI.
+## [0.12.0] - 2026-11-24
 
-### Changed
-- **The engine keeps audit rows for 90 days by default (was 365).** The 500 000-row size cap stays, and both limits stay configurable (`EngineConfig::audit_retention`).
-- **Engine and client log lines are structured.** Diagnostics that were plain `eprintln!` lines now use the `elog!` format (`<UTC time> <LEVEL> <target>: <message>`, one record per line). CLI output to the user does not change.
-- **c9p `SessionView` is its own wire type.** The engine converts the internal session record to `SessionView` at the API boundary, and the published schema is generated from `SessionView`. The wire bytes and `docs/api/c9p-1.json` do not change; a golden test and a leak test guard both.
-- **The engine checks the Claude Code version before it starts an agent.** Every screen glyph, prompt text, key, delay and socket path the engine uses to drive Claude Code now lives in one profile, recorded on Claude Code 2.1.312 up to (not including) 2.2.0. A create or resume on another version, or on a version the engine cannot read, still runs with that profile and writes a warning with the version and the supported range to the engine log and the audit. A missing `claude` at boot leaves the agent resumable instead of failed. Socket mail no longer starts a thread and a runtime for each message.
+### Added
+- **Dense view** in Monitor: each project is a tile and each session is one row with its status, provider, message count, cost and age. Tiles that need you get an orange outline, and a tile moves only when its status group changes. **Compact** hides the preview line; **A− / A+** scales the text ([#164](https://github.com/minchenlee/c9watch/pull/164)).
+- **Sort the Monitor** by Attention first (default), Project (A–Z) or Last active, in Project, Show All and Dense views. The choice is saved ([#247](https://github.com/minchenlee/c9watch/pull/247)).
+- **Settings → Monitor** chooses what each card shows: model, reasoning effort, working time, Git branch, message count, cost or tokens, and session age ([#248](https://github.com/minchenlee/c9watch/pull/248)).
+- **Agent-team teammates** show as their own sessions. The lead's card shows `LEAD N`, each teammate's card shows `MATE` ([#221](https://github.com/minchenlee/c9watch/pull/221)).
+- **Claude Code's own session titles** (`ai-title`) name unnamed Claude Code sessions, instead of a derived name such as `c9watch-b5`. Names you set still come first. `c9watch list` adds `aiTitle` ([#166](https://github.com/minchenlee/c9watch/pull/166)).
+
+### Fixed
+- **Much less memory at launch.** Transcripts are read in small batches instead of whole files; on 3.9 GB of live transcripts the first refresh went from about 950 MB to 49 MB ([#185](https://github.com/minchenlee/c9watch/pull/185)).
+- **The desktop window no longer grows while it stays open.** List reorders in the desktop app no longer leave an animation behind ([#251](https://github.com/minchenlee/c9watch/pull/251), thanks [@bnjdpn](https://github.com/bnjdpn)).
+- **History opens fast.** The tab keeps its rows on refresh and draws 100 rows at a time ([#187](https://github.com/minchenlee/c9watch/pull/187)).
+
+### Removed
+- The preview agent engine, the PM orchestration commands, the c9p SDK and the extension host. They were never in a release; c9watch is monitoring only ([#209](https://github.com/minchenlee/c9watch/pull/209), [#250](https://github.com/minchenlee/c9watch/pull/250), [#252](https://github.com/minchenlee/c9watch/pull/252)).
 
 ### Security
-- **Engine agents do not run without the Bash sandbox.** Every spawn now sets `sandbox.failIfUnavailable: true`. Before, Claude Code on Linux without `bubblewrap` or `socat` started with the sandbox off and ran Bash unconfined, so a Bash command could write core's own files that only the sandbox protects. Now such an agent ends `spawn_failed` (or `resume_failed`) with Claude Code's error text. On Linux, install `bubblewrap` and `socat`, or engine agents will not start.
-- **Gateway `/c9p` pairing uses client public keys (D15).** Each remote client makes its own Ed25519 key pair and proves it with a signature over lowercase hex nonces. Core stores only public keys (new `gateway_clients` table; the unused bearer-token table is dropped). The bearer-token and HMAC reconnect profile is removed from the spec, the SDK and the GUI adapter. The `/c9p` listener is not wired yet; legacy `/ws` mobile pairing is unchanged.
-
 These changes break old mobile clients, QR codes and bookmarks on purpose. See [docs/mobile-migration-c0h.md](docs/mobile-migration-c0h.md) before you upgrade.
 
 - **Port 9210 listens on this Mac only.** LAN access is a new opt-in in **Settings → Remote access**. With it on, traffic is plain `ws://`, and the settings page says so.
@@ -28,7 +33,7 @@ These changes break old mobile clients, QR codes and bookmarks on purpose. See [
 - **The server checks `Host` on every route and `Origin` on the WebSocket upgrade**, and sends a strict content security policy. The desktop webview has a strict CSP too. Remote images in Markdown no longer load.
 - **Stop resolves the session itself.** `session.stop{addr}` replaces `stopSession{pid}`; c9watch signals only a detected Claude Code session whose process start time still matches. A refused stop shows its reason. `openSession` also takes `{addr}` and uses the detected project path.
 - **The access URL is no longer logged** or printed as a terminal QR code.
-- **The PM daemon state directory is private** (`0700`, files `0600`), it refuses clients of another user, and a second daemon can no longer take over the socket. Run `pkill -f 'c9watch daemon'` once after upgrading.
+- **Notification titles use the project name** on a remote device without conversation access, so the first prompt does not appear in the title ([#191](https://github.com/minchenlee/c9watch/pull/191)).
 
 ## [0.11.1] - 2026-10-15
 
