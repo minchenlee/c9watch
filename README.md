@@ -190,6 +190,9 @@ See [SKILLS.md](SKILLS.md) for more install options.
 - **Conversation viewer** -- Expand any session to view the full conversation with formatted markdown, code blocks, and inline images
 - **Session control** -- Stop sessions, open their parent terminal/IDE, or rename them for easier tracking
 - **Multi-project view** -- Sessions grouped by project with git branch info
+- **Dense view** -- Every session on one screen: one tile per project, one row per session, with Compact mode and adjustable text size
+- **Sort and customize Monitor** -- Sort by attention, project name or last activity; choose which details cards show (model, reasoning effort, working time, branch, messages, cost, age) in Settings → Monitor
+- **Agent-team teammates** -- Claude Code agent-team teammates appear as their own sessions, linked to their lead
 - **Tray popover** -- Click the menu bar icon for a quick-glance overlay with session status indicators and latest messages
 - **Status notifications** -- Get a native macOS notification when a session needs your attention
 - **Mobile/Web client** -- Watch sessions from a phone or another browser over WebSocket. Remote access is off by default: turn on LAN access in Settings → Remote access, then pair the device with a one-time code or QR code from Connect Mobile. Conversations and opening a terminal from the device are separate opt-in settings. LAN traffic is plain `ws://`, so use it only on a network you trust. See [docs/mobile-migration-c0h.md](docs/mobile-migration-c0h.md)
