@@ -10,6 +10,34 @@ head:
 
 All notable changes to c9watch are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.12.0 — 2026-11-24
+
+### Added
+- **Dense view** in Monitor: each project is a tile and each session is one row with its status, provider, message count, cost and age. Tiles that need you get an orange outline, and a tile moves only when its status group changes. **Compact** hides the preview line; **A− / A+** scales the text ([#164](https://github.com/minchenlee/c9watch/pull/164)).
+- **Sort the Monitor** by Attention first (default), Project (A–Z) or Last active, in Project, Show All and Dense views. The choice is saved ([#247](https://github.com/minchenlee/c9watch/pull/247)).
+- **Settings → Monitor** chooses what each card shows: model, reasoning effort, working time, Git branch, message count, cost or tokens, and session age ([#248](https://github.com/minchenlee/c9watch/pull/248)).
+- **Agent-team teammates** show as their own sessions. The lead's card shows `LEAD N`, each teammate's card shows `MATE` ([#221](https://github.com/minchenlee/c9watch/pull/221)).
+- **Claude Code's own session titles** (`ai-title`) name unnamed Claude Code sessions, instead of a derived name such as `c9watch-b5`. Names you set still come first. `c9watch list` adds `aiTitle` ([#166](https://github.com/minchenlee/c9watch/pull/166)).
+
+### Fixed
+- **Much less memory at launch.** Transcripts are read in small batches instead of whole files; on 3.9 GB of live transcripts the first refresh went from about 950 MB to 49 MB ([#185](https://github.com/minchenlee/c9watch/pull/185)).
+- **The desktop window no longer grows while it stays open.** List reorders in the desktop app no longer leave an animation behind ([#251](https://github.com/minchenlee/c9watch/pull/251), thanks [@bnjdpn](https://github.com/bnjdpn)).
+- **History opens fast.** The tab keeps its rows on refresh and draws 100 rows at a time ([#187](https://github.com/minchenlee/c9watch/pull/187)).
+
+### Removed
+- The preview agent engine, the PM orchestration commands, the c9p SDK and the extension host. They were never in a release; c9watch is monitoring only ([#209](https://github.com/minchenlee/c9watch/pull/209), [#250](https://github.com/minchenlee/c9watch/pull/250), [#252](https://github.com/minchenlee/c9watch/pull/252)).
+
+### Security
+These changes break old mobile clients, QR codes and bookmarks on purpose. See [docs/mobile-migration-c0h.md](https://github.com/minchenlee/c9watch/blob/main/docs/mobile-migration-c0h.md) before you upgrade.
+
+- **Port 9210 listens on this Mac only.** LAN access is a new opt-in in **Settings → Remote access**. With it on, traffic is plain `ws://`, and the settings page says so.
+- **Pairing codes replace tokens in URLs.** Connect Mobile shows a one-time 8-character code (5 minutes, single use) and a QR code that carries it in the URL fragment. A device sends its token in the first WebSocket frame, never in the URL. Old `?token=` URLs stop working; devices must pair again. **Forget paired devices** disconnects them all.
+- **Remote devices see cards only by default.** Conversations (including the first prompt, latest messages and pending tool input in session pushes) and opening a terminal are separate opt-in settings.
+- **The server checks `Host` on every route and `Origin` on the WebSocket upgrade**, and sends a strict content security policy. The desktop webview has a strict CSP too. Remote images in Markdown no longer load.
+- **Stop resolves the session itself.** `session.stop{addr}` replaces `stopSession{pid}`; c9watch signals only a detected Claude Code session whose process start time still matches. A refused stop shows its reason. `openSession` also takes `{addr}` and uses the detected project path.
+- **The access URL is no longer logged** or printed as a terminal QR code.
+- **Notification titles use the project name** on a remote device without conversation access, so the first prompt does not appear in the title ([#191](https://github.com/minchenlee/c9watch/pull/191)).
+
 ## 0.11.1 — 2026-10-15
 
 ### Added
