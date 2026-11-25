@@ -13,7 +13,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned: clippy runs with -D warnings, and each stable release adds
+        # lints. Bump this on purpose and fix the new warnings in that PR.
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy, rustfmt
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -53,6 +57,12 @@ jobs:
       - name: Rust check
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
+      - name: Rust lint (clippy)
+        # Lints are set in src-tauri/Cargo.toml [workspace.lints].
+        run: |
+          cargo clippy --manifest-path src-tauri/Cargo.toml \
+            --workspace --all-targets -- -D warnings
+
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
@@ -63,6 +73,11 @@ jobs:
         run: |
           cargo check --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features cli
+
+      - name: CLI-only lint (clippy)
+        run: |
+          cargo clippy --manifest-path src-tauri/Cargo.toml --workspace \
+            --all-targets --no-default-features --features cli -- -D warnings
 
       - name: CLI-only tests
         run: |
@@ -161,7 +176,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned: clippy runs with -D warnings, and each stable release adds
+        # lints. Bump this on purpose and fix the new warnings in that PR.
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy, rustfmt
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -208,6 +227,12 @@ jobs:
             cargo check --manifest-path "$m" -p c9watch-core --features "$f"
           done
           cargo check --manifest-path "$m" -p c9watch-core --all-features
+
+      - name: Linux lint (clippy)
+        # Some code is Linux-only (e.g. the IPv4 listener in gateway/policy.rs).
+        run: |
+          cargo clippy --manifest-path src-tauri/Cargo.toml --workspace \
+            --all-targets --no-default-features --features cli -- -D warnings
 
       - name: Prod channel build check
         # CI builds are dev channel by default. Check the prod cfg path too.
