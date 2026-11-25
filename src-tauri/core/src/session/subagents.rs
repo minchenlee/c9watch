@@ -22,19 +22,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
-// JSONL entry type constants
-const ENTRY_TYPE_TOOL_USE: &str = "tool_use";
-const ENTRY_TYPE_TOOL_RESULT: &str = "tool_result";
-const ENTRY_TYPE_QUEUE_OPERATION: &str = "queue-operation";
-const ENTRY_TYPE_USER: &str = "user";
-
-// Tag name constants
-const TAG_TASK_ID: &str = "task-id";
-const TAG_TOOL_USE_ID: &str = "tool-use-id";
-const TAG_RESULT: &str = "result";
-const TAG_USAGE: &str = "usage";
-const TAG_NOTIFICATION: &str = "task-notification";
-
 /// Status of a detected subagent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -725,8 +712,7 @@ fn parse_agent_id_from_stub(text: &str) -> Option<String> {
         while let Some(rel) = text[search_from..].find(key) {
             let idx = search_from + rel + key.len();
             // Advance past any quote/colon/space/equals chars.
-            let rest = text[idx..]
-                .trim_start_matches(|c: char| matches!(c, ':' | '=' | ' ' | '\t' | '"' | '\''));
+            let rest = text[idx..].trim_start_matches([':', '=', ' ', '\t', '"', '\'']);
             let candidate: String = rest
                 .chars()
                 .take_while(|c| c.is_ascii_hexdigit() || *c == '-' || *c == '_')
@@ -1046,7 +1032,7 @@ mod tests {
         let pad = format!(r#"{{"type":"system","pad":"{}"}}"#, "x".repeat(4096));
         let pads = crate::session::cache::LINE_BATCH_BYTES / pad.len() + 1;
         let mut lines = vec![start];
-        lines.extend(std::iter::repeat(pad.as_str()).take(pads));
+        lines.extend(std::iter::repeat_n(pad.as_str(), pads));
         lines.push(done);
         let f = write_jsonl(&lines);
 
@@ -1346,7 +1332,7 @@ mod tests {
             original.push_str(&filler_line);
         }
         let middle_offset = original.len();
-        original.push_str(&middle_old);
+        original.push_str(middle_old);
         original.push('\n');
         while original.len()
             < crate::session::cache::EXACT_PREFIX_VERIFY_LIMIT as usize + 256 * 1024

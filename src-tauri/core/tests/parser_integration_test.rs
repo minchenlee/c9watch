@@ -153,7 +153,7 @@ fn test_message_type_extraction() {
 
                 // There should be at least some messages
                 assert!(
-                    messages.len() > 0,
+                    !messages.is_empty(),
                     "Should have extracted at least one message"
                 );
             }

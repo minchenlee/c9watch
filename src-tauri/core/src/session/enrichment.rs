@@ -2333,7 +2333,7 @@ mod placeholder_tests {
             original.push_str(&filler_line);
         }
         let middle_offset = original.len();
-        original.push_str(&middle_old);
+        original.push_str(middle_old);
         original.push('\n');
         while original.len()
             < crate::session::cache::EXACT_PREFIX_VERIFY_LIMIT as usize + 256 * 1024
@@ -2567,7 +2567,7 @@ mod hook_prompt_tests {
         std::fs::remove_file(project.join("s1")).unwrap();
         std::fs::rename(&elsewhere, project.join("s1")).unwrap();
         std::os::unix::fs::symlink(
-            &subagents.join("agent-a1.jsonl"),
+            subagents.join("agent-a1.jsonl"),
             subagents.join("agent-a2.jsonl"),
         )
         .unwrap();

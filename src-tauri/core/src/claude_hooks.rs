@@ -1878,7 +1878,7 @@ mod review_regressions_v3 {
         let path = dir.path().join("settings.json");
         fs::write(&path, installed_settings()).unwrap();
         let mtime = fs::metadata(&path).unwrap().modified().unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
         assert!(
             fs::read(&path).is_err(),
             "hermetic basis must actually deny this uid"

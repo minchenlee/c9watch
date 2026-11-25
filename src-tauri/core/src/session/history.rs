@@ -272,11 +272,11 @@ fn phrase_match(haystack: &str, needle: &str, whole_word: bool) -> bool {
         let before_ok = haystack[..pos]
             .chars()
             .next_back()
-            .map_or(true, |c| !c.is_alphanumeric());
+            .is_none_or(|c| !c.is_alphanumeric());
         let after_ok = haystack[pos + nlen..]
             .chars()
             .next()
-            .map_or(true, |c| !c.is_alphanumeric());
+            .is_none_or(|c| !c.is_alphanumeric());
         if before_ok && after_ok {
             return true;
         }
@@ -304,15 +304,13 @@ fn extract_snippet(text: &str, text_norm: &str, query_norm: &str) -> String {
     let start = text
         .char_indices()
         .map(|(i, _)| i)
-        .filter(|&i| i <= start)
-        .last()
+        .rfind(|&i| i <= start)
         .unwrap_or(0);
     let end = text
         .char_indices()
         .map(|(i, _)| i)
         .chain(std::iter::once(text.len()))
-        .filter(|&i| i >= end)
-        .next()
+        .find(|&i| i >= end)
         .unwrap_or(text.len());
 
     let mut snippet = String::new();
@@ -444,7 +442,7 @@ pub fn deep_search_under(
                     // original when case-sensitive, or lowercased otherwise.
                     let messages: Vec<(String, String)> = content
                         .lines()
-                        .filter_map(|line| extract_message_text(line))
+                        .filter_map(extract_message_text)
                         .map(|text| {
                             let norm = if case_sensitive {
                                 text.clone()
@@ -487,7 +485,7 @@ pub fn deep_search_under(
         .into_inner()
         .map_err(|e| format!("Mutex poisoned: {e}"))?;
 
-    let codex_snapshots: Vec<_> = super::codex_archive::load_default_snapshots(&home_dir)
+    let codex_snapshots: Vec<_> = super::codex_archive::load_default_snapshots(home_dir)
         .into_iter()
         .filter(|snapshot| !snapshot.is_internal())
         .collect();
@@ -545,7 +543,7 @@ pub fn deep_search_under(
             .map_err(|error| format!("Codex search mutex poisoned: {error}"))?,
     );
     result.extend(crate::session::cursor::search_cursor_transcripts(
-        &home_dir,
+        home_dir,
         query_norm.as_str(),
         case_sensitive,
         whole_word,
@@ -553,7 +551,7 @@ pub fn deep_search_under(
         extract_snippet,
     ));
     result.extend(crate::session::pi::pi_deep_search(
-        &home_dir,
+        home_dir,
         query,
         case_sensitive,
         whole_word,

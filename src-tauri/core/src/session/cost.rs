@@ -675,7 +675,7 @@ pub fn get_cost_data_in(
             cache
                 .file_mtimes
                 .get(key)
-                .map_or(true, |cached_mtime| mtime > cached_mtime)
+                .is_none_or(|cached_mtime| mtime > cached_mtime)
         })
         .map(|(key, path, _)| (key.clone(), path.clone()))
         .collect();

@@ -5,6 +5,10 @@ description = "c9watch core: session readers and the c9watch CLI (no tauri)"
 authors.workspace = true
 edition.workspace = true
 
+
+[lints]
+workspace = true
+
 [lib]
 name = "c9watch_core"
 

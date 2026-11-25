@@ -543,7 +543,7 @@ pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::H
     let entries: Vec<_> = collect_transcript_refs(&projects_root)
         .into_iter()
         .filter(|item| item.agent_kind == AgentKind::Root)
-        .filter_map(|item| {
+        .map(|item| {
             let display = cursor_history_first_prompt(&item.path)
                 .unwrap_or_else(|| "(No conversation yet)".to_string());
             let mut cwd = decode_cursor_project_key(&item.project_key);
@@ -565,7 +565,7 @@ pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::H
                 .and_then(system_time_millis)
                 .unwrap_or(0)
                 .max(0) as u64;
-            Some(crate::session::history::HistoryEntry {
+            crate::session::history::HistoryEntry {
                 session_id: item.session_id,
                 display,
                 timestamp,
@@ -579,7 +579,7 @@ pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::H
                 surface: Some("cursor".to_string()),
                 agent_kind: Some("root".to_string()),
                 truncated: false,
-            })
+            }
         })
         .collect();
 
@@ -919,7 +919,7 @@ fn parse_transcript_range(
     let modified = metadata.modified().ok().and_then(system_time_millis);
     let created = metadata.created().ok().and_then(system_time_millis);
     let last_timestamp = modified
-        .and_then(|ms| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms))
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default();
     let mut saw_lifecycle = existing.is_some();
@@ -948,7 +948,7 @@ fn parse_transcript_range(
         if bytes_read == 0 {
             break;
         }
-        if !buf.ends_with(&[b'\n']) {
+        if !buf.ends_with(b"\n") {
             break;
         }
         offset += bytes_read as u64;
@@ -2829,7 +2829,7 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap()
-            .write_all(partial[..partial.len() / 2].as_bytes())
+            .write_all(&partial.as_bytes()[..partial.len() / 2])
             .unwrap();
 
         let (torn, _) = source.detect().unwrap();
@@ -2840,7 +2840,7 @@ mod tests {
 
         // Complete the line; it must appear exactly once.
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(partial[partial.len() / 2..].as_bytes())
+        file.write_all(&partial.as_bytes()[partial.len() / 2..])
             .unwrap();
         writeln!(file).unwrap();
         drop(file);

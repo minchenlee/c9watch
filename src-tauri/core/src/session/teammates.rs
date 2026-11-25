@@ -604,7 +604,7 @@ fn subagent_transcript_in(
     let st = unsafe { st.assume_init() };
     if st.st_mode & libc::S_IFMT != libc::S_IFREG
         || st.st_dev as u64 != pinned.dev()
-        || st.st_ino as u64 != pinned.ino()
+        || st.st_ino != pinned.ino()
     {
         return None;
     }

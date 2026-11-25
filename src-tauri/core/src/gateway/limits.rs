@@ -1,13 +1,30 @@
 //! Transport limits shared by GUI and core.
 use std::time::Duration;
 pub const WS_PORT: u16 = 9210;
+/// At most this many sockets may be waiting to authenticate at once. Each
+/// can hold a buffered frame for up to `AUTH_TIMEOUT`.
 pub const MAX_UNAUTHENTICATED: usize = 16;
+/// Largest first frame read as an auth frame. A token or code frame is
+/// well under 200 bytes.
 pub const MAX_AUTH_FRAME_BYTES: usize = 4 * 1024;
+/// Largest message (and frame) a client may send. Requests are small JSON;
+/// `getAwayActivity` with a few hundred sessions is the biggest. axum sets
+/// this for the whole socket at upgrade, so it is also the bound on what an
+/// unauthenticated client can make the server buffer (axum's default is
+/// 64 MiB).
 pub const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+/// How long a client has to send its first frame and get it accepted.
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Close code: the first frame was missing, late, or not an auth frame.
 pub const CLOSE_BAD_HANDSHAKE: u16 = 4400;
+/// Close code: the token or pairing code was not accepted. The client
+/// must pair again; it should not retry on its own.
 pub const CLOSE_UNAUTHORIZED: u16 = 4401;
+/// Close code: the pairing code was wrong, expired or already used. Unlike
+/// 4401 it says nothing about a token the client may already hold.
 pub const CLOSE_PAIR_REJECTED: u16 = 4403;
+/// Close code sent when the remote-access policy changes (1012, "service
+/// restart"); the client reconnects.
 pub const CLOSE_POLICY_CHANGED: u16 = 1012;
 
 /// Deterministic token bucket. One instance belongs to one principal, across

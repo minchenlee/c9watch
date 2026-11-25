@@ -9,7 +9,6 @@ impl Assets {
     pub fn read(path: &str) -> Option<Vec<u8>> {
         #[cfg(feature = "gateway-assets")]
         {
-            use rust_embed::RustEmbed;
             Self::get(path).map(|f| f.data.into_owned())
         }
         #[cfg(not(feature = "gateway-assets"))]
