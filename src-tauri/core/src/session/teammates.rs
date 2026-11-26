@@ -602,10 +602,11 @@ fn subagent_transcript_in(
     }
     // SAFETY: `fstatat` succeeded and filled `st`.
     let st = unsafe { st.assume_init() };
-    if st.st_mode & libc::S_IFMT != libc::S_IFREG
-        || st.st_dev as u64 != pinned.dev()
-        || st.st_ino != pinned.ino()
-    {
+    // `dev_t` and `ino_t` differ by target (macOS `dev_t` is i32, Linux
+    // x86_64 is u64, i686 `ino_t` is u32), so the casts stay on all of them.
+    #[allow(clippy::unnecessary_cast)]
+    let (dev, ino) = (st.st_dev as u64, st.st_ino as u64);
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG || dev != pinned.dev() || ino != pinned.ino() {
         return None;
     }
     let session = open_at(&dir.fd, session_id, libc::O_RDONLY | libc::O_DIRECTORY)?;

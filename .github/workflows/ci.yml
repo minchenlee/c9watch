@@ -230,9 +230,15 @@ jobs:
 
       - name: Linux lint (clippy)
         # Some code is Linux-only (e.g. the IPv4 listener in gateway/policy.rs).
+        # The gateway needs the gui feature, so the core crate is also linted
+        # with all features (core has no tauri dependency, see D32 above).
         run: |
-          cargo clippy --manifest-path src-tauri/Cargo.toml --workspace \
+          set -euo pipefail
+          m=src-tauri/Cargo.toml
+          cargo clippy --manifest-path "$m" --workspace \
             --all-targets --no-default-features --features cli -- -D warnings
+          cargo clippy --manifest-path "$m" -p c9watch-core \
+            --all-features --all-targets -- -D warnings
 
       - name: Prod channel build check
         # CI builds are dev channel by default. Check the prod cfg path too.
