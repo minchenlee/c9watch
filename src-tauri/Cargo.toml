@@ -32,6 +32,10 @@ items_after_test_module = "allow"
 # an `if` inside a match arm with side effects).
 unnecessary_sort_by = "allow"
 collapsible_match = "allow"
+# libc field types differ by target (st_mode is u16 on macOS, u32 on
+# Linux; dev_t is i32 vs u64). A cast that macOS needs is "unnecessary"
+# on Linux, so this lint cannot pass on both.
+unnecessary_cast = "allow"
 
 [package]
 name = "c9watch"
