@@ -37,8 +37,8 @@ pub struct ProjectMemory {
 /// Decode a Claude projects directory name back to a real path.
 /// e.g. "-Users-liminchen-Documents-GitHub-c9watch" → "/Users/liminchen/Documents/GitHub/c9watch"
 fn decode_project_dir(dir_name: &str) -> String {
-    if dir_name.starts_with('-') {
-        format!("/{}", dir_name[1..].replace('-', "/"))
+    if let Some(rest) = dir_name.strip_prefix('-') {
+        format!("/{}", rest.replace('-', "/"))
     } else {
         dir_name.replace('-', "/")
     }

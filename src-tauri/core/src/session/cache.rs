@@ -570,14 +570,14 @@ impl FileVersion {
             let changed_nanos = metadata
                 .ctime()
                 .saturating_mul(1_000_000_000)
-                .saturating_add(metadata.ctime_nsec() as i64)
+                .saturating_add(metadata.ctime_nsec())
                 .max(0) as u128;
-            return Ok(Self {
+            Ok(Self {
                 len: metadata.len(),
                 modified_nanos,
                 changed_nanos,
                 identity: metadata.ino(),
-            });
+            })
         }
 
         #[cfg(not(unix))]
@@ -621,7 +621,7 @@ pub(crate) fn can_incrementally_read(previous: FileVersion, current: FileVersion
 /// advance once per second.  Callers must content-validate or fully parse when
 /// this returns false.
 pub(crate) fn has_strong_file_stamp(changed_nanos: u128, file_id: u64) -> bool {
-    file_id != 0 && changed_nanos != 0 && changed_nanos % 1_000_000_000 != 0
+    file_id != 0 && changed_nanos != 0 && !changed_nanos.is_multiple_of(1_000_000_000)
 }
 
 #[cfg(test)]

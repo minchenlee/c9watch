@@ -392,7 +392,7 @@ impl CodexSessionSource {
             }
         }
 
-        let discovery_due = self.last_full_discovery.map_or(true, |last| {
+        let discovery_due = self.last_full_discovery.is_none_or(|last| {
             wall_now.duration_since(last).unwrap_or_default().as_secs()
                 >= FULL_DISCOVERY_INTERVAL_SECS
         });

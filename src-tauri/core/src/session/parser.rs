@@ -92,6 +92,7 @@ pub struct SessionEntryBase {
 /// In Claude Code's JSONL format, user message content can be either:
 /// - A plain string (for actual user prompts)
 /// - An array of content blocks (for tool results sent back to Claude)
+///
 /// A base64-encoded image found in a user message content array
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -518,7 +519,7 @@ fn format_system_tags(tags: &[(String, String)]) -> String {
                 continue;
             }
             if !result.is_empty() {
-                let _ = write!(result, "\n");
+                let _ = writeln!(result);
             }
             result.push_str(value);
         }

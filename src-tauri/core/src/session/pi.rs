@@ -731,7 +731,7 @@ fn read_pi_conversation_under_with_tools(
     session_id: &str,
     include_tools: bool,
 ) -> Result<Vec<PiConversationMessage>, String> {
-    let path = pi_conversation_path_for_session(&home, session_id)
+    let path = pi_conversation_path_for_session(home, session_id)
         .ok_or_else(|| format!("pi session {session_id} not found"))?;
     let reader = BufReader::new(
         File::open(&path).map_err(|e| format!("Failed to read pi transcript: {e}"))?,

@@ -428,7 +428,7 @@ fn refresh_rollout_once(
     previous: Option<CachedRollout>,
 ) -> Option<CachedRollout> {
     let mut file = File::open(path).ok()?;
-    let mut reset = previous.as_ref().map_or(true, |cached| {
+    let mut reset = previous.as_ref().is_none_or(|cached| {
         !has_strong_fingerprint(fingerprint)
             || !has_strong_fingerprint(cached.fingerprint)
             || cached.prefix_hash == 0
@@ -710,6 +710,7 @@ fn rebuild_token_days(snapshot: &mut CodexRolloutSnapshot) {
     });
 }
 
+#[cfg(test)]
 pub(crate) fn scan_rollout(path: &Path) -> Option<CodexRolloutSnapshot> {
     let fingerprint = fingerprint(path)?;
     let cached = refresh_rollout(path, fingerprint, None)?;
@@ -1341,7 +1342,7 @@ mod tests {
                     || text[index + query.len()..]
                         .chars()
                         .next()
-                        .map_or(true, |character| !character.is_alphanumeric())
+                        .is_none_or(|character| !character.is_alphanumeric())
             },
         );
         assert!(hit.is_none());
@@ -1547,8 +1548,7 @@ mod tests {
             .unwrap();
         writeln!(
             file,
-            "\n{}",
-            r#"{"timestamp":"2026-07-13T01:02:00Z","type":"event_msg","payload":{"type":"user_message","message":"second"}}"#
+            "\n{{\"timestamp\":\"2026-07-13T01:02:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"second\"}}}}"
         )
         .unwrap();
         let appended = load_snapshots(&root, &cache_path);
@@ -1731,8 +1731,7 @@ mod tests {
         let mut file = File::create(&path).unwrap();
         writeln!(
             file,
-            "{}",
-            r#"{"type":"session_meta","payload":{"id":"large","cwd":"/tmp","source":"cli"}}"#
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"large\",\"cwd\":\"/tmp\",\"source\":\"cli\"}}}}"
         )
         .unwrap();
         let line = format!(

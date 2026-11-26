@@ -698,16 +698,6 @@ fn serve_embedded_file(path: &str) -> impl IntoResponse {
 
 // ── WebSocket handler ───────────────────────────────────────────────
 
-/// At most this many sockets may be waiting to authenticate at once. Each
-/// can hold a buffered frame for up to `AUTH_TIMEOUT`.
-/// Largest first frame read as an auth frame. A token or code frame is
-/// well under 200 bytes.
-/// Largest message (and frame) a client may send. Requests are small JSON;
-/// `getAwayActivity` with a few hundred sessions is the biggest. axum sets
-/// this for the whole socket at upgrade, so it is also the bound on what an
-/// unauthenticated client can make the server buffer (axum's default is
-/// 64 MiB).
-
 /// One reserved unauthenticated-socket slot; released on drop.
 struct UnauthenticatedSlot(Arc<WsState>);
 
@@ -753,13 +743,6 @@ async fn ws_handler(
 }
 
 // ── Handshake ───────────────────────────────────────────────────────
-
-/// How long a client has to send its first frame and get it accepted.
-/// Close code: the first frame was missing, late, or not an auth frame.
-/// Close code: the token or pairing code was not accepted. The client
-/// must pair again; it should not retry on its own.
-/// Close code: the pairing code was wrong, expired or already used. Unlike
-/// 4401 it says nothing about a token the client may already hold.
 
 /// The first frame a client sends. Nothing else is read before it.
 #[derive(Deserialize)]
@@ -877,9 +860,6 @@ fn close_with(code: u16, reason: &'static str) -> Message {
         reason: reason.into(),
     }))
 }
-
-/// Close code sent when the remote-access policy changes (1012, "service
-/// restart"); the client reconnects.
 
 async fn handle_socket(
     mut socket: WebSocket,
@@ -2019,9 +1999,6 @@ mod server_tests {
             .unwrap();
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     }
-
-    const PORT: u16 = 9210;
-    const LAN_IP: &str = "192.168.1.20";
 
     #[tokio::test]
     async fn default_policy_serves_on_loopback_only() {

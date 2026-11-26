@@ -12,6 +12,31 @@ version = "0.12.0"
 authors = ["minchenlee"]
 edition = "2021"
 
+# Lints for every crate in the workspace (each package opts in with
+# `[lints] workspace = true`). CI runs `cargo clippy -- -D warnings` on the
+# toolchain pinned in .github/workflows/ci.yml, so a new warning fails the PR.
+[workspace.lints.rust]
+# `mobile` is set by tauri-build. The CLI-only build has no tauri-build.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(mobile)"] }
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Style lints that would need a refactor to satisfy; not worth it here.
+type_complexity = "allow"
+new_without_default = "allow"
+field_reassign_with_default = "allow"
+items_after_test_module = "allow"
+# Rewrites that read no better here (sort_by with a reversed compare,
+# an `if` inside a match arm with side effects).
+unnecessary_sort_by = "allow"
+collapsible_match = "allow"
+# libc field types differ by target (st_mode is u16 on macOS, u32 on
+# Linux; dev_t is i32 vs u64). A cast that macOS needs is "unnecessary"
+# on Linux, so this lint cannot pass on both.
+unnecessary_cast = "allow"
+
 [package]
 name = "c9watch"
 version.workspace = true
@@ -19,6 +44,9 @@ description = "Monitor and control Claude Code sessions, with Codex and Cursor A
 authors.workspace = true
 edition.workspace = true
 default-run = "c9watch"
+
+[lints]
+workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

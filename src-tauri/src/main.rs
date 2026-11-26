@@ -23,13 +23,13 @@ fn main() {
             }
         }
 
-        // CLI-only build: no GUI available, show help if no args
+        // CLI-only build: no GUI available, show help if no args.
+        // Nothing runs after this block when the gui feature is off.
         #[cfg(not(feature = "gui"))]
         {
             use clap::Parser;
             let cli = c9watch_lib::cli::Cli::parse();
             c9watch_lib::cli::run(cli);
-            return;
         }
     }
 

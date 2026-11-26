@@ -119,6 +119,7 @@ pub struct BindPlan {
 /// `EADDRINUSE`. The `[::]` listener replaces the loopback ones.
 pub fn bind_plan(remote: &RemoteAccess, port: u16) -> BindPlan {
     let addrs = if remote.lan_enabled {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut addrs = vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)];
         #[cfg(target_os = "linux")]
         addrs.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));

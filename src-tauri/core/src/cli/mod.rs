@@ -565,7 +565,7 @@ fn cmd_history(limit: Option<usize>, pretty: bool) -> Result<(), String> {
     let enriched: Vec<serde_json::Value> = entries
         .into_iter()
         .take(limit.unwrap_or(usize::MAX))
-        .map(|entry| enrich_history_entry(entry))
+        .map(enrich_history_entry)
         .collect();
 
     print_json(&enriched, pretty)
@@ -609,7 +609,7 @@ fn cmd_search_output(
 
     let enriched: Vec<serde_json::Value> = hits
         .into_iter()
-        .map(|hit| enrich_search_hit(hit))
+        .map(enrich_search_hit)
         .filter(|hit| search_hit_matches_project(hit, project_filter))
         .take(limit)
         .collect();

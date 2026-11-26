@@ -40,7 +40,6 @@ Fixes #(issue)
 <!-- Check all that apply -->
 
 - [ ] My code follows the project's style guidelines
-- [ ] I have run `cargo fmt` and `cargo clippy` on Rust code
 - [ ] I have performed a self-review of my code
 - [ ] I have commented my code, particularly in hard-to-understand areas
 - [ ] My changes generate no new warnings

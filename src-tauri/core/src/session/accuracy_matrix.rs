@@ -479,6 +479,7 @@ fn claude_cli(tmp: &Path, scenario: Scenario) -> Fixture {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unimplemented)]
 fn claude_cli(_tmp: &Path, _scenario: Scenario) -> Fixture {
     unimplemented!("the fake `claude` binary is a shell script")
 }

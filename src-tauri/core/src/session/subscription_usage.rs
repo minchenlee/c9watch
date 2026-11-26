@@ -514,7 +514,7 @@ mod tests {
             "codex",
             "Codex",
             Err("reader exited".into()),
-            &[stale.clone()],
+            std::slice::from_ref(&stale),
         );
         assert!(codex.windows.is_empty());
         let fresh = parse_cursor_snapshot(&json!({"planUsage":{"totalPercentUsed":42}}), None);
