@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Running Agent SDK programs show up.** A Python or TypeScript program built on the Claude Agent SDK (`sdk-py`, `sdk-ts`) is now listed in `list`, `watch` and the Monitor while it runs, with its waits, when it writes a project transcript (the SDK's default). Integrations that keep none, such as editors or `persistSession: false`, stay out as before.
+
 ## [0.12.0] - 2026-11-24
 
 ### Added

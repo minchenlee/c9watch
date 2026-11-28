@@ -407,9 +407,10 @@ impl SessionSource for CliSessionSource {
             (self.start_times)(&pids)
         };
 
-        // Filter out non-CLI entrypoints (e.g. sdk-ts from Zed/IDE integrations).
-        // `claude agents --json` lists every live agent including SDK-driven ones,
-        // but those don't write project JSONLs and aren't what c9watch monitors.
+        // Filter out SDK-driven agents that keep no transcript (e.g. sdk-ts from
+        // Zed/IDE integrations). `claude agents --json` lists every live agent,
+        // including programs built on the Agent SDK; those that do write a
+        // project JSONL (the SDK's default) are monitored like any CLI session.
         // The per-pid metadata at ~/.claude/sessions/<pid>.json carries `entrypoint`.
         // If the file is missing or unreadable, keep the agent (older CC versions).
         // Read once per agent and reuse for both the filter decision and the
@@ -431,7 +432,12 @@ impl SessionSource for CliSessionSource {
                 if pid_was_reused(&recorded, process_start) {
                     return None;
                 }
-                is_monitored_entrypoint(meta.entrypoint.as_deref())
+                let has_transcript = || {
+                    home.as_deref().is_some_and(|home| {
+                        resolve_project_path_under(home, &a.cwd, &a.session_id).is_some()
+                    })
+                };
+                is_monitored_entrypoint(meta.entrypoint.as_deref(), has_transcript)
                     .then(|| self.map_agent_to_session(a, meta, process_start))
             })
             .collect();
@@ -633,10 +639,11 @@ fn is_known_blocked_background(object: &Map<String, Value>) -> bool {
     is_background && state == Some("blocked")
 }
 
-/// `entrypoint` values known to be third-party SDK integrations (Zed/IDE)
-/// that never write project JSONLs — the thing the entrypoint filter actually
-/// needs to exclude. Everything else is kept, including CLI-launched
-/// entrypoints we don't recognize yet: CC has already added new ones without
+/// `entrypoint` values of Agent SDK programs. Some (Zed/IDE integrations,
+/// `persistSession: false`) never write project JSONLs — the thing the
+/// entrypoint filter actually needs to exclude — while most SDK programs do,
+/// so these are kept whenever their transcript exists. Everything else is
+/// kept, including CLI-launched entrypoints we don't recognize yet: CC has already added new ones without
 /// notice (e.g. "sdk-cli" for headless `claude -p`, alongside the interactive
 /// "cli", as of 2.1.278) and a real CLI process writes a real transcript
 /// regardless of which entrypoint label it gets, so failing open here is
@@ -696,11 +703,16 @@ fn reports_prompts_as_waiting(version: (u32, u32, u32)) -> bool {
 }
 
 /// Whether an agent with this resolved `entrypoint` should be monitored (kept
-/// in the detected list) — i.e. not one of `NON_MONITORED_SDK_ENTRYPOINTS`.
-fn is_monitored_entrypoint(entrypoint: Option<&str>) -> bool {
-    entrypoint
-        .map(|ep| !NON_MONITORED_SDK_ENTRYPOINTS.contains(&ep))
-        .unwrap_or(true)
+/// in the detected list): anything but `NON_MONITORED_SDK_ENTRYPOINTS`, and
+/// those too when they have a transcript to read.
+fn is_monitored_entrypoint(
+    entrypoint: Option<&str>,
+    has_transcript: impl FnOnce() -> bool,
+) -> bool {
+    match entrypoint {
+        Some(ep) if NON_MONITORED_SDK_ENTRYPOINTS.contains(&ep) => has_transcript(),
+        _ => true,
+    }
 }
 
 /// Stateless resolver used by both production code (with real `home_dir()`) and
@@ -1667,7 +1679,7 @@ mod tests {
     /// Combines `pid_meta_under` + `is_monitored_entrypoint`, mirroring
     /// what `detect()`'s filter_map does per-agent.
     fn is_cli_entrypoint_under(home: &Path, pid: u32) -> bool {
-        is_monitored_entrypoint(pid_meta_under(home, pid).entrypoint.as_deref())
+        is_monitored_entrypoint(pid_meta_under(home, pid).entrypoint.as_deref(), || false)
     }
 
     fn write_session_meta(home: &Path, pid: u32, entrypoint: Option<&str>) {
@@ -1699,6 +1711,40 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_session_meta(tmp.path(), 3, Some("sdk-py"));
         assert!(!is_cli_entrypoint_under(tmp.path(), 3));
+    }
+
+    #[test]
+    fn entrypoint_filter_keeps_sdk_agents_that_write_a_transcript() {
+        // Agent SDK programs write a project JSONL by default; those are real
+        // sessions to monitor. Without one (persistSession: false, IDE
+        // integrations) they stay filtered.
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/work/agent");
+        let sid = "11111111-2222-4333-8444-555555555555";
+        for (pid, ep) in [(4, "sdk-py"), (5, "sdk-ts")] {
+            write_session_meta(tmp.path(), pid, Some(ep));
+            let ep = pid_meta_under(tmp.path(), pid).entrypoint;
+            let has = || resolve_project_path_under(tmp.path(), cwd, sid).is_some();
+            assert!(
+                !is_monitored_entrypoint(ep.as_deref(), has),
+                "{pid} without transcript"
+            );
+        }
+        let proj = tmp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(encode_path_for_matching(&cwd.to_string_lossy()));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(format!("{sid}.jsonl")), b"{}\n").unwrap();
+        for pid in [4, 5] {
+            let ep = pid_meta_under(tmp.path(), pid).entrypoint;
+            let has = || resolve_project_path_under(tmp.path(), cwd, sid).is_some();
+            assert!(
+                is_monitored_entrypoint(ep.as_deref(), has),
+                "{pid} with transcript"
+            );
+        }
     }
 
     #[test]
